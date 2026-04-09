@@ -16,6 +16,7 @@ Backend compatibility:
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
+- SearXNG: https://docs.searxng.org/dev/search_api.html (search only)
 - Tavily: https://tavily.com (search, extract, crawl)
 
 LLM Processing:
@@ -54,6 +55,7 @@ from agent.auxiliary_client import (
     get_async_text_auxiliary_client,
 )
 from tools.debug_helpers import DebugSession
+from tools.registry import tool_error
 from tools.managed_tool_gateway import (
     build_vendor_gateway_url,
     read_nous_access_token as _read_nous_access_token,
@@ -80,6 +82,50 @@ def _load_web_config() -> dict:
     except (ImportError, Exception):
         return {}
 
+
+def _get_searxng_url() -> str:
+    """Return the configured SearXNG origin."""
+    url = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
+    if not url:
+        raise ValueError(
+            "SEARXNG_URL is not set. Point it at your SearXNG instance, "
+            "for example http://127.0.0.1:8892"
+        )
+    return url
+
+
+def _normalize_searxng_search_results(raw: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    """Normalize SearXNG JSON results to Hermes' standard search shape."""
+    web_results: List[Dict[str, Any]] = []
+    for idx, item in enumerate((raw.get("results") or [])[: max(limit, 0)], start=1):
+        if not isinstance(item, dict):
+            continue
+        web_results.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "description": str(item.get("content") or item.get("description") or ""),
+                "position": idx,
+            }
+        )
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _searxng_search(query: str, limit: int) -> Dict[str, Any]:
+    """Run a search against SearXNG and normalize the response."""
+    response = httpx.get(
+        f"{_get_searxng_url()}/search",
+        params={"q": query, "format": "json"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Hermes-Agent/1.0",
+        },
+        timeout=20.0,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    return _normalize_searxng_search_results(response.json(), limit)
+
 def _get_backend() -> str:
     """Determine which web backend to use.
 
@@ -88,13 +134,15 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("searxng", "parallel", "firecrawl", "tavily", "exa"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
-    # available backend. Firecrawl also counts as available when the managed
-    # tool gateway is configured for Nous subscribers.
+    # available backend. Prefer an explicitly configured self-hosted SearXNG
+    # instance before vendor APIs. Firecrawl also counts as available when the
+    # managed tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("searxng", _has_env("SEARXNG_URL")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -109,6 +157,8 @@ def _get_backend() -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "searxng":
+        return _has_env("SEARXNG_URL")
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -184,6 +234,7 @@ def _firecrawl_backend_help_suffix() -> str:
 def _web_requires_env() -> list[str]:
     """Return tool metadata env vars for the currently enabled web backends."""
     requires = [
+        "SEARXNG_URL",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
@@ -1037,7 +1088,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     Search the web for information using available search API backend.
 
     This function provides a generic interface for web search that can work
-    with multiple backends (Parallel or Firecrawl).
+    with multiple backends (including self-hosted SearXNG).
 
     Note: This function returns search result metadata only (URLs, titles, descriptions).
     Use web_extract_tool to get full content from specific URLs.
@@ -1095,6 +1146,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "exa":
             response_data = _exa_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "searxng":
+            response_data = _searxng_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1245,6 +1305,14 @@ async def web_extract_tool(
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
+            elif backend == "searxng":
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "SearXNG is configured for search only. Configure Firecrawl, Tavily, or Parallel for extraction, or use browser_navigate on the returned URLs.",
+                    },
+                    ensure_ascii=False,
+                )
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
                 raw = _tavily_request("extract", {
@@ -1542,6 +1610,19 @@ async def web_crawl_tool(
         effective_model = model or _get_default_summarizer_model()
         auxiliary_available = check_auxiliary_model()
         backend = _get_backend()
+
+        if backend == "searxng":
+            if check_firecrawl_api_key():
+                logger.info("SearXNG configured for search; falling back to Firecrawl for crawl")
+                backend = "firecrawl"
+            else:
+                return json.dumps(
+                    {
+                        "error": "web_crawl requires a crawl-capable backend. SearXNG supports search only. Configure Firecrawl or Tavily, or use web_search + browser tools instead.",
+                        "success": False,
+                    },
+                    ensure_ascii=False,
+                )
 
         # Tavily supports crawl via its /crawl endpoint
         if backend == "tavily":
@@ -1922,9 +2003,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("searxng", "exa", "parallel", "firecrawl", "tavily"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("searxng", "exa", "parallel", "firecrawl", "tavily"))
 
 
 def check_auxiliary_model() -> bool:
@@ -1997,7 +2078,7 @@ if __name__ == "__main__":
         print(f"   Debug logs will be saved to: {_debug.log_dir}/web_tools_debug_{_debug.session_id}.json")
     else:
         print("🐛 Debug mode disabled (set WEB_TOOLS_DEBUG=true to enable)")
-    
+
     print("\nBasic usage:")
     print("  from web_tools import web_search_tool, web_extract_tool, web_crawl_tool")
     print("  import asyncio")
@@ -2010,7 +2091,7 @@ if __name__ == "__main__":
     print("      content = await web_extract_tool(['https://example.com'])")
     print("      crawl_data = await web_crawl_tool('example.com', 'Find docs')")
     print("  asyncio.run(main())")
-    
+
     if nous_available:
         print("\nLLM-enhanced usage:")
         print("  # Content automatically processed for pages >5000 chars (default)")
@@ -2026,7 +2107,7 @@ if __name__ == "__main__":
         print("")
         print("  # Disable LLM processing")
         print("  raw_content = await web_extract_tool(['https://example.com'], use_llm_processing=False)")
-    
+
     print("\nDebug mode:")
     print("  # Enable debug logging")
     print("  export WEB_TOOLS_DEBUG=true")
@@ -2036,14 +2117,14 @@ if __name__ == "__main__":
     print("  # - LLM compression metrics")
     print("  # - Final processed results")
     print("  # Logs saved to: ./logs/web_tools_debug_UUID.json")
-    
+
     print("\n📝 Run 'python test_web_tools_llm.py' to test LLM processing capabilities")
 
 
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import registry
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
