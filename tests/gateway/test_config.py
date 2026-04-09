@@ -381,6 +381,27 @@ class TestLoadGatewayConfig:
         import os
         assert os.environ.get("TELEGRAM_PROXY") == "socks5://from-env:1080"
 
+    def test_bridges_discord_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_prompts:\n"
+            "    \"1491882634677059616\":\n"
+            "      label: System Thread Persona\n"
+            "      prompt: >-\n"
+            "        Act as Hephaestus and focus on implementation.\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra["channel_prompts"]["1491882634677059616"]["label"] == "System Thread Persona"
+        assert "Hephaestus" in config.platforms[Platform.DISCORD].extra["channel_prompts"]["1491882634677059616"]["prompt"]
+
 
 class TestHomeChannelEnvOverrides:
     """Home channel env vars should apply even when the platform was already
