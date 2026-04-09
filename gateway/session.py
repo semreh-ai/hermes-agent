@@ -87,6 +87,7 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
+    parent_chat_id: Optional[str] = None  # Parent channel/group ID for threaded conversations
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Signal UUID (alternative to phone number)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
@@ -121,6 +122,7 @@ class SessionSource:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "thread_id": self.thread_id,
+            "parent_chat_id": self.parent_chat_id,
             "chat_topic": self.chat_topic,
         }
         if self.user_id_alt:
@@ -139,6 +141,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            parent_chat_id=(str(data.get("parent_chat_id")) if data.get("parent_chat_id") is not None else None),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
@@ -239,7 +242,7 @@ def _resolve_channel_prompt(source: SessionSource, config: GatewayConfig) -> Opt
         return None
 
     candidate_keys = []
-    for value in (source.chat_id, source.thread_id):
+    for value in (source.chat_id, source.thread_id, source.parent_chat_id):
         if not value:
             continue
         sval = str(value)

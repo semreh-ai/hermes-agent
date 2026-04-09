@@ -1778,6 +1778,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_id=str(interaction.user.id),
             user_name=interaction.user.display_name,
             thread_id=thread_id,
+            parent_chat_id=self._get_parent_channel_id(interaction.channel) if is_thread else None,
             chat_topic=chat_topic,
         )
 
@@ -1854,6 +1855,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_id=str(interaction.user.id),
             user_name=interaction.user.display_name,
             thread_id=thread_id,
+            parent_chat_id=self._get_parent_channel_id(_chan) if _chan else None,
             chat_topic=chat_topic,
         )
 
@@ -2274,6 +2276,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if thread:
                     is_thread = True
                     thread_id = str(thread.id)
+                    parent_channel_id = str(message.channel.id)
                     auto_threaded_channel = thread
                     self._track_thread(thread_id)
 
@@ -2329,6 +2332,7 @@ class DiscordAdapter(BasePlatformAdapter):
             user_id=str(message.author.id),
             user_name=message.author.display_name,
             thread_id=thread_id,
+            parent_chat_id=parent_channel_id,
             chat_topic=chat_topic,
         )
 
