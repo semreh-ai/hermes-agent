@@ -54,6 +54,22 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_full_roundtrip_with_parent_chat_id(self):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1491882634677059616",
+            chat_name="OLYMPUS / Hermes Thread",
+            chat_type="thread",
+            thread_id="1491882634677059616",
+            parent_chat_id="1469067017100329003",
+        )
+        d = source.to_dict()
+        assert d["parent_chat_id"] == "1469067017100329003"
+
+        restored = SessionSource.from_dict(d)
+        assert restored.parent_chat_id == "1469067017100329003"
+        assert restored.thread_id == "1491882634677059616"
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -301,6 +317,39 @@ class TestBuildSessionContextPrompt:
         assert "System Thread Persona" in prompt
         assert "Act as Hephaestus" in prompt
         assert "shipping code" in prompt
+
+    def test_discord_thread_prompt_inherits_parent_channel_instructions(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                    extra={
+                        "channel_prompts": {
+                            "1469067017100329003": {
+                                "label": "Hermes Workshop",
+                                "prompt": "Stay focused on Hermes development, bugfixes, feature work, and ROI research.",
+                            }
+                        }
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1491882634677059616",
+            chat_name="OLYMPUS / Hermes Thread",
+            chat_type="thread",
+            user_name="alice",
+            thread_id="1491882634677059616",
+            parent_chat_id="1469067017100329003",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Hermes Workshop" in prompt
+        assert "Hermes development" in prompt
+        assert "ROI research" in prompt
 
     def test_local_prompt_mentions_machine(self):
         config = GatewayConfig()
