@@ -299,6 +299,7 @@ class TestBackendSelection:
 
     _ENV_KEYS = (
         "HERMES_ENABLE_NOUS_MANAGED_TOOLS",
+        "SEARXNG_URL",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
@@ -342,6 +343,13 @@ class TestBackendSelection:
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "firecrawl"
 
+    def test_config_searxng(self):
+        """web.backend=searxng in config → 'searxng' regardless of other keys."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "searxng"}), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            assert _get_backend() == "searxng"
+
     def test_config_tavily(self):
         """web.backend=tavily in config → 'tavily' regardless of other keys."""
         from tools.web_tools import _get_backend
@@ -375,6 +383,20 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
+
+    def test_fallback_searxng_only_url(self):
+        """Only SEARXNG_URL set → 'searxng'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"SEARXNG_URL": "http://127.0.0.1:8892"}):
+            assert _get_backend() == "searxng"
+
+    def test_fallback_searxng_takes_priority_over_firecrawl(self):
+        """SEARXNG_URL + Firecrawl config, no pinned backend → prefer SearXNG."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"SEARXNG_URL": "http://127.0.0.1:8892", "FIRECRAWL_API_KEY": "fc-test"}):
+            assert _get_backend() == "searxng"
 
     def test_fallback_exa_only_key(self):
         """Only EXA_API_KEY set → 'exa'."""
@@ -519,11 +541,37 @@ class TestWebSearchErrorHandling:
         assert "traceback" not in result
 
 
+class TestWebSearchSearxng:
+    """Test web_search_tool dispatch to SearXNG."""
+
+    def test_search_dispatches_to_searxng(self):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "results": [{"title": "Result", "url": "https://r.com", "content": "desc"}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("tools.web_tools._get_backend", return_value="searxng"), \
+             patch.dict(os.environ, {"SEARXNG_URL": "http://127.0.0.1:8892"}), \
+             patch("tools.web_tools.httpx.get", return_value=mock_response) as mock_get, \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            from tools.web_tools import web_search_tool
+            result = json.loads(web_search_tool("test query", limit=3))
+
+        assert result["success"] is True
+        assert result["data"]["web"][0]["title"] == "Result"
+        assert result["data"]["web"][0]["url"] == "https://r.com"
+        mock_get.assert_called_once()
+        assert mock_get.call_args.args[0] == "http://127.0.0.1:8892/search"
+        assert mock_get.call_args.kwargs["params"] == {"q": "test query", "format": "json"}
+
+
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""
 
     _ENV_KEYS = (
         "HERMES_ENABLE_NOUS_MANAGED_TOOLS",
+        "SEARXNG_URL",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "FIRECRAWL_API_KEY",
@@ -562,6 +610,11 @@ class TestCheckWebApiKey:
 
     def test_firecrawl_url_only(self):
         with patch.dict(os.environ, {"FIRECRAWL_API_URL": "http://localhost:3002"}):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
+    def test_searxng_url_only(self):
+        with patch.dict(os.environ, {"SEARXNG_URL": "http://127.0.0.1:8892"}):
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
@@ -615,3 +668,4 @@ def test_web_requires_env_includes_exa_key():
     from tools.web_tools import _web_requires_env
 
     assert "EXA_API_KEY" in _web_requires_env()
+    assert "SEARXNG_URL" in _web_requires_env()
