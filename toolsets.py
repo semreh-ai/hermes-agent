@@ -201,6 +201,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "tailscale": {
+        "description": "Expose local services to your tailnet via Tailscale Serve, and transfer files between tailnet devices",
+        "tools": ["tailscale_serve", "tailscale_status"],
+        "includes": []
+    },
+
     "feishu_doc": {
         "description": "Read Feishu/Lark document content",
         "tools": ["feishu_doc_read"],
