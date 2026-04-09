@@ -91,16 +91,34 @@ class TestAgentConfigSignature:
         """Reasoning config is set per-message, not part of the signature."""
         from gateway.run import GatewayRunner
 
-        runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        runtime = {"api_key": "***", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
         # Same config — signature should be identical regardless of what
         # reasoning_config the caller might have (it's not passed in)
         sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         assert sig1 == sig2
 
+    def test_ephemeral_prompt_change_different_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "***", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        sig1 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4",
+            runtime,
+            ["hermes-discord"],
+            "Act as Hephaestus.",
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "claude-sonnet-4",
+            runtime,
+            ["hermes-discord"],
+            "Act as Athena.",
+        )
+        assert sig1 != sig2
+
 
 class TestAgentCacheLifecycle:
-    """End-to-end cache behavior with real AIAgent construction."""
+
 
     def test_cache_hit_returns_same_agent(self):
         """Second message with same config reuses the cached agent instance."""

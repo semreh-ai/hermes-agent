@@ -534,6 +534,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if isinstance(platform_cfg.get("channel_prompts"), dict):
+                    bridged["channel_prompts"] = platform_cfg["channel_prompts"]
                 if not bridged:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})

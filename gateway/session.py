@@ -164,10 +164,13 @@ class SessionContext:
     - Where messages are coming from
     - What platforms are available
     - Where it can deliver scheduled task outputs
+    - What channel-scoped instructions should apply in this chat
     """
     source: SessionSource
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
+    channel_prompt_label: Optional[str] = None
+    channel_prompt_text: Optional[str] = None
     
     # Session metadata
     session_key: str = ""
@@ -182,11 +185,75 @@ class SessionContext:
             "home_channels": {
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
+            "channel_prompt_label": self.channel_prompt_label,
+            "channel_prompt_text": self.channel_prompt_text,
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+def _normalize_channel_prompt_entry(entry: Any) -> Optional[Dict[str, str]]:
+    """Normalize channel prompt config to a {label, prompt} mapping."""
+    if isinstance(entry, str):
+        prompt = entry.strip()
+        if not prompt:
+            return None
+        return {
+            "label": "Channel Instructions",
+            "prompt": prompt,
+        }
+
+    if not isinstance(entry, dict):
+        return None
+
+    prompt = (
+        entry.get("prompt")
+        or entry.get("system_prompt")
+        or entry.get("instructions")
+    )
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+
+    label = (
+        entry.get("label")
+        or entry.get("title")
+        or entry.get("name")
+        or "Channel Instructions"
+    )
+    return {
+        "label": str(label).strip() or "Channel Instructions",
+        "prompt": prompt.strip(),
+    }
+
+
+def _resolve_channel_prompt(source: SessionSource, config: GatewayConfig) -> Optional[Dict[str, str]]:
+    """Resolve an optional channel-specific prompt for the current source."""
+    platform_cfg = config.platforms.get(source.platform)
+    if not platform_cfg or not isinstance(platform_cfg.extra, dict):
+        return None
+
+    channel_prompts = platform_cfg.extra.get("channel_prompts")
+    if not isinstance(channel_prompts, dict):
+        return None
+
+    candidate_keys = []
+    for value in (source.chat_id, source.thread_id):
+        if not value:
+            continue
+        sval = str(value)
+        if sval not in candidate_keys:
+            candidate_keys.append(sval)
+        scoped = f"{source.platform.value}:{sval}"
+        if scoped not in candidate_keys:
+            candidate_keys.append(scoped)
+
+    for key in candidate_keys:
+        if key in channel_prompts:
+            return _normalize_channel_prompt_entry(channel_prompts[key])
+
+    return None
 
 
 _PII_SAFE_PLATFORMS = frozenset({
@@ -254,6 +321,11 @@ def build_session_context_prompt(
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    if context.channel_prompt_text:
+        lines.append("")
+        lines.append(f"**{context.channel_prompt_label or 'Channel Instructions'}:**")
+        lines.append(context.channel_prompt_text)
 
     # User identity.
     # In shared thread sessions (non-DM with thread_id), multiple users
@@ -1067,10 +1139,14 @@ def build_session_context(
         if home:
             home_channels[platform] = home
     
+    channel_prompt = _resolve_channel_prompt(source, config)
+
     context = SessionContext(
         source=source,
         connected_platforms=connected,
         home_channels=home_channels,
+        channel_prompt_label=(channel_prompt or {}).get("label"),
+        channel_prompt_text=(channel_prompt or {}).get("prompt"),
     )
     
     if session_entry:

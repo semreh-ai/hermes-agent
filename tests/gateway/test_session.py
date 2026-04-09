@@ -265,6 +265,37 @@ class TestBuildSessionContextPrompt:
 
         assert "Channel Topic" not in prompt
 
+    def test_discord_prompt_includes_channel_specific_instructions(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                    extra={
+                        "channel_prompts": {
+                            "1491882634677059616": {
+                                "label": "System Thread Persona",
+                                "prompt": "Act as Hephaestus. Focus on implementation details and shipping code.",
+                            }
+                        }
+                    },
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1491882634677059616",
+            chat_name="OLYMPUS / #system🤖",
+            chat_type="group",
+            user_name="alice",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "System Thread Persona" in prompt
+        assert "Act as Hephaestus" in prompt
+        assert "shipping code" in prompt
+
     def test_local_prompt_mentions_machine(self):
         config = GatewayConfig()
         source = SessionSource.local_cli()
