@@ -18,6 +18,14 @@ Features:
   ``agent-browser install --with-deps`` (also installs system libraries for
   Debian/Ubuntu/Docker).
 - **Cloud mode**: Browserbase or Browser Use cloud execution when configured.
+- **Automatic CamoFox fallback**: if the standard browser hits bot-detection
+  (Cloudflare challenge, CAPTCHA, 403, auth wall, etc.), Hermes transparently
+  retries the operation via CamoFox — the stealth Firefox backend — and returns
+  the real page content. Controlled by ``CAMOFOX_URL`` in ``~/.hermes/.env``
+  (typically ``http://localhost:9377``). The fallback fires on
+  ``browser_navigate`` (detects
+  in title, URL, or auto-snapshot) and surfaces as a warning in
+  ``browser_snapshot`` if detection slipped through.
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
 - Element interaction via ref selectors (@e1, @e2, etc.)
@@ -92,6 +100,124 @@ except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
+
+# ─── Bot-detection auto-fallback to CamoFox ─────────────────────────────────
+
+# Per-task flag to prevent infinite retry loops when CamoFox also hits detection.
+# Keyed by effective task_id so each concurrent task is independent.
+_CAMOFOX_FALLBACK_ATTEMPTED: Dict[str, bool] = {}
+
+# Text/regex patterns that signal the current page is a bot-challenge / auth wall.
+# Scanned by _is_bot_detected() to decide whether to switch to CamoFox transparently.
+_BOT_DETECTION_PATTERNS = (
+    # Cloudflare
+    (re.compile(r"cloudflare", re.I), "Cloudflare challenge"),
+    (re.compile(r"checking your browser", re.I), "Cloudflare browser check"),
+    (re.compile(r"ray\s*id", re.I), "Cloudflare Ray ID"),
+    (re.compile(r"jschl", re.I), "Cloudflare JS challenge"),
+    (re.compile(r"just a moment", re.I), "Cloudflare 'Just a moment'"),
+    (re.compile(r"ddos protection", re.I), "DDoS protection page"),
+    # CAPTCHA
+    (re.compile(r"\bcaptcha\b", re.I), "CAPTCHA"),
+    (re.compile(r"recaptcha", re.I), "reCAPTCHA"),
+    (re.compile(r"hcaptcha", re.I), "hCaptcha"),
+    (re.compile(r"turnstile", re.I), "Cloudflare Turnstile"),
+    # Auth walls / login gates / blocked content
+    (re.compile(r"sign in to continue", re.I), "login wall"),
+    (re.compile(r"please sign in", re.I), "auth wall"),
+    (re.compile(r"log in\s", re.I), "login prompt"),
+    (re.compile(r"access denied", re.I), "access denied"),
+    (re.compile(r"403\b", re.I), "403 Forbidden"),
+    (re.compile(r"too many requests", re.I), "rate limit"),
+    (re.compile(r"unusual traffic", re.I), "unusual traffic block"),
+    (re.compile(r"verification required", re.I), "verification required"),
+    (re.compile(r"are you a robot", re.I), "robot check"),
+    (re.compile(r"verify you", re.I), "human verification"),
+    # Bot/automation blocks
+    (re.compile(r"bot detected", re.I), "bot detected"),
+    (re.compile(r"automated access", re.I), "automated access"),
+    (re.compile(r"security check", re.I), "security check"),
+    (re.compile(r"blocked your request", re.I), "request blocked"),
+    (re.compile(r"client challenge", re.I), "client challenge"),
+    (re.compile(r"Attention Required!", re.I), "Cloudflare attention required"),
+    (re.compile(r"One more step", re.I), "challenge 'one more step'"),
+)
+
+# Additional patterns keyed by browser-command error messages (exact or substring).
+_BOT_DETECTION_ERROR_KEYWORDS = frozenset((
+    "cloudflare", "captcha", "recaptcha", "hcaptcha", "ddos",
+    "access denied", "403", "bot detected", "automated access",
+    "blocked", "unusual traffic", "rate limit",
+))
+
+
+def _is_bot_detected(text: str) -> tuple[bool, str]:
+    """Return (True, reason) if text contains bot-detection patterns, else (False, '')."""
+    if not text:
+        return False, ""
+    for pattern, reason in _BOT_DETECTION_PATTERNS:
+        if pattern.search(text):
+            return True, reason
+    return False, ""
+
+
+def _is_bot_detection_error(error_str: str) -> tuple[bool, str]:
+    """Return (True, reason) if an error string indicates bot detection."""
+    if not error_str:
+        return False, ""
+    lower = error_str.lower()
+    for kw in _BOT_DETECTION_ERROR_KEYWORDS:
+        if kw in lower:
+            return True, kw
+    return False, ""
+
+
+def _try_camofox_fallback(
+    task_id: Optional[str],
+    fallback_fn,
+) -> tuple[bool, str]:
+    """Attempt to redo an action via CamoFox.
+
+    Returns:
+        (True,  camofox_result)  — CamoFox was available and the fallback ran.
+        (False, original_error)   — CamoFox not available or already attempted; caller keeps original result.
+
+    """
+    etid = task_id or "default"
+
+    # Prevent infinite loops: if CamoFox also shows a challenge page, don't recurse.
+    if _CAMOFOX_FALLBACK_ATTEMPTED.get(etid):
+        return False, ""
+
+    # Camofox must not already be the active backend (guard is redundant since
+    # _is_camofox_mode() is checked before entering this path, but defensive).
+    try:
+        from tools.browser_camofox import is_camofox_mode as _cf_mode
+        if _cf_mode():
+            return False, ""
+    except Exception:
+        pass
+
+    # Mark BEFORE calling CamoFox so if CamoFox itself triggers detection
+    # we don't loop back to the standard browser.
+    _CAMOFOX_FALLBACK_ATTEMPTED[etid] = True
+
+    try:
+        result = fallback_fn()
+        logger.info("Bot-detection auto-fallback to CamoFox succeeded for task %s", etid)
+        return True, result
+    except Exception as exc:
+        logger.warning("CamoFox fallback for task %s raised: %s", etid, exc)
+        # Undo the flag so a genuine user retry can try CamoFox again.
+        _CAMOFOX_FALLBACK_ATTEMPTED.pop(etid, None)
+        return False, str(exc)
+
+
+def _reset_camofox_fallback(task_id: Optional[str]) -> None:
+    """Reset the fallback guard at the start of a new task."""
+    etid = task_id or "default"
+    _CAMOFOX_FALLBACK_ATTEMPTED.pop(etid, None)
+
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
@@ -1434,7 +1560,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return camofox_navigate(url, task_id)
 
     effective_task_id = task_id or "default"
-    
+    _reset_camofox_fallback(effective_task_id)
+
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
     session_info = _get_session_info(effective_task_id)
@@ -1470,24 +1597,37 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "title": title
         }
         
-        # Detect common "blocked" page patterns from title/url
-        blocked_patterns = [
-            "access denied", "access to this page has been denied",
-            "blocked", "bot detected", "verification required",
-            "please verify", "are you a robot", "captcha",
-            "cloudflare", "ddos protection", "checking your browser",
-            "just a moment", "attention required"
-        ]
-        title_lower = title.lower()
-        
-        if any(pattern in title_lower for pattern in blocked_patterns):
-            response["bot_detection_warning"] = (
-                f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
-                "Options: 1) Try adding delays between actions, 2) Access different pages first, "
-                "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
-                "4) Some sites have very aggressive bot detection that may be unavoidable."
+        # Detect bot-detection / auth-wall patterns in title and URL.
+        # If found, transparently retry via CamoFox so the caller gets real content.
+        detected_title, reason_title = _is_bot_detected(title)
+        detected_url, reason_url = _is_bot_detected(final_url)
+        if detected_title or detected_url:
+            reason = reason_title or reason_url
+            logger.info("Bot detection on task %s (%s) — retrying via CamoFox", effective_task_id, reason)
+
+            def _camofox_retry():
+                from tools.browser_camofox import camofox_navigate
+                return camofox_navigate(url, task_id)
+
+            triggered, cf_result = _try_camofox_fallback(
+                effective_task_id, _camofox_retry
             )
-        
+            if triggered:
+                # CamoFox succeeded — inject a note so the caller knows what happened.
+                try:
+                    cf_data = json.loads(cf_result)
+                    cf_data["_camofox_fallback"] = True
+                    cf_data["_original_detection"] = reason
+                    return json.dumps(cf_data, ensure_ascii=False)
+                except Exception:
+                    return cf_result
+            # CamoFox unavailable / already attempted — return original with warning.
+            response["bot_detection_warning"] = (
+                f"Page title '{title}' suggests bot detection ({reason}). "
+                "Standard browser cannot bypass it. "
+                "Set CAMOFOX_URL in ~/.hermes/.env to enable CamoFox for this task."
+            )
+
         # Include feature info on first navigation so model knows what's active
         if is_first_nav and "features" in session_info:
             features = session_info["features"]
@@ -1511,11 +1651,67 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     snapshot_text = _truncate_snapshot(snapshot_text)
                 response["snapshot"] = snapshot_text
                 response["element_count"] = len(refs) if refs else 0
+
+                # Check the actual page content returned by the auto-snapshot.
+                # If it looks like a challenge page, retry via CamoFox.
+                detected_snap, snap_reason = _is_bot_detected(snapshot_text)
+                if detected_snap:
+                    logger.info(
+                        "Bot detection in auto-snapshot on task %s (%s) — retrying via CamoFox",
+                        effective_task_id, snap_reason
+                    )
+
+                    def _cf_retry_nav():
+                        from tools.browser_camofox import camofox_navigate
+                        return camofox_navigate(url, task_id)
+
+                    triggered, cf_result = _try_camofox_fallback(
+                        effective_task_id, _cf_retry_nav
+                    )
+                    if triggered:
+                        try:
+                            cf_data = json.loads(cf_result)
+                            cf_data["_camofox_fallback"] = True
+                            cf_data["_original_detection"] = snap_reason
+                            return json.dumps(cf_data, ensure_ascii=False)
+                        except Exception:
+                            return cf_result
+                    # CamoFox not available — include warning in response.
+                    response["bot_detection_warning"] = (
+                        f"Page content suggests bot detection ({snap_reason}). "
+                        "Standard browser cannot bypass it. "
+                        "Set CAMOFOX_URL in ~/.hermes/.env to enable CamoFox for this task."
+                    )
         except Exception as e:
             logger.debug("Auto-snapshot after navigate failed: %s", e)
 
         return json.dumps(response, ensure_ascii=False)
     else:
+        # Navigation command itself failed — check if it's a bot-detection error.
+        err = result.get("error", "")
+        detected_err, err_reason = _is_bot_detection_error(err)
+        if detected_err:
+            logger.info(
+                "Bot-detection error on task %s (%s) — retrying via CamoFox",
+                effective_task_id, err_reason
+            )
+
+            def _cf_retry_nav_err():
+                from tools.browser_camofox import camofox_navigate
+                return camofox_navigate(url, task_id)
+
+            triggered, cf_result = _try_camofox_fallback(
+                effective_task_id, _cf_retry_nav_err
+            )
+            if triggered:
+                try:
+                    cf_data = json.loads(cf_result)
+                    cf_data["_camofox_fallback"] = True
+                    cf_data["_original_detection"] = err_reason
+                    return json.dumps(cf_data, ensure_ascii=False)
+                except Exception:
+                    return cf_result
+            # CamoFox unavailable — fall through to return the original error.
         return json.dumps({
             "success": False,
             "error": result.get("error", "Navigation failed")
@@ -1567,9 +1763,33 @@ def browser_snapshot(
             "snapshot": snapshot_text,
             "element_count": len(refs) if refs else 0
         }
-        
+
+        # Check if the snapshot content itself looks like a challenge / auth wall.
+        # Note: unlike browser_navigate, we cannot retry via CamoFox here because
+        # CamoFox manages its own independent browser tab — we don't have the URL
+        # in scope to open the same page there.  We surface the detection so the
+        # model can call browser_navigate with CamoFox directly.
+        detected_snap, snap_reason = _is_bot_detected(snapshot_text)
+        if detected_snap:
+            logger.info(
+                "Bot detection in browser_snapshot on task %s (%s) — surfacing warning",
+                effective_task_id, snap_reason
+            )
+            response["bot_detection_warning"] = (
+                f"Page content suggests bot detection ({snap_reason}). "
+                "Set CAMOFOX_URL in ~/.hermes/.env so browser_navigate can retry "
+                "the page through CamoFox."
+            )
+
         return json.dumps(response, ensure_ascii=False)
     else:
+        err = result.get("error", "")
+        detected_err, err_reason = _is_bot_detection_error(err)
+        if detected_err:
+            logger.info(
+                "Bot-detection error in browser_snapshot on task %s (%s)",
+                effective_task_id, err_reason
+            )
         return json.dumps({
             "success": False,
             "error": result.get("error", "Failed to get snapshot")
