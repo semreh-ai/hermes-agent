@@ -91,6 +91,65 @@ _local_model_name: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 
+def get_stt_model_from_config() -> Optional[str]:
+    """Read the configured STT model from config without forcing provider defaults.
+
+    Explicit provider-specific keys win. The legacy top-level ``stt.model`` key is
+    only used when no provider is declared, or as an OpenAI fallback.
+    Silently returns ``None`` on any error (missing file, bad YAML, etc.).
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        stt_config = read_raw_config().get("stt", {})
+    except Exception:
+        return None
+
+    if not isinstance(stt_config, dict) or not stt_config:
+        return None
+
+    provider = stt_config.get("provider")
+
+    if provider in {"local", "local_command"}:
+        return stt_config.get("local", {}).get("model")
+
+    if provider == "openai":
+        return stt_config.get("openai", {}).get("model") or stt_config.get("model")
+
+    if provider == "mistral":
+        return stt_config.get("mistral", {}).get("model")
+
+    if provider == "groq":
+        return stt_config.get("groq", {}).get("model")
+
+    return stt_config.get("model")
+
+
+def _resolve_model_for_provider(
+    stt_config: dict,
+    provider: str,
+    model_override: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the runtime STT model for the selected provider."""
+    if model_override is not None:
+        return model_override
+
+    if provider in {"local", "local_command"}:
+        return stt_config.get("local", {}).get("model", DEFAULT_LOCAL_MODEL)
+
+    if provider == "groq":
+        return stt_config.get("groq", {}).get("model", DEFAULT_GROQ_STT_MODEL)
+
+    if provider == "openai":
+        return (
+            stt_config.get("openai", {}).get("model")
+            or stt_config.get("model")
+            or DEFAULT_STT_MODEL
+        )
+
+    if provider == "mistral":
+        return stt_config.get("mistral", {}).get("model", DEFAULT_MISTRAL_STT_MODEL)
+
+    return model_override
 
 def _load_stt_config() -> dict:
     """Load the ``stt`` section from user config, falling back to defaults."""
@@ -595,29 +654,25 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     provider = _get_provider(stt_config)
 
     if provider == "local":
-        local_cfg = stt_config.get("local", {})
-        model_name = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        model_name = _resolve_model_for_provider(stt_config, provider, model)
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":
-        local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_command_model(
-            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+            _resolve_model_for_provider(stt_config, provider, model)
         )
         return _transcribe_local_command(file_path, model_name)
 
     if provider == "groq":
-        model_name = model or DEFAULT_GROQ_STT_MODEL
+        model_name = _resolve_model_for_provider(stt_config, provider, model)
         return _transcribe_groq(file_path, model_name)
 
     if provider == "openai":
-        openai_cfg = stt_config.get("openai", {})
-        model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
+        model_name = _resolve_model_for_provider(stt_config, provider, model)
         return _transcribe_openai(file_path, model_name)
 
     if provider == "mistral":
-        mistral_cfg = stt_config.get("mistral", {})
-        model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
+        model_name = _resolve_model_for_provider(stt_config, provider, model)
         return _transcribe_mistral(file_path, model_name)
 
     # No provider available

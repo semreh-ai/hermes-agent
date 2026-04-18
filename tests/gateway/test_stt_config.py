@@ -114,3 +114,26 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_enrich_message_with_transcription_lets_transcriber_resolve_model():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "decoded"},
+    ) as mock_transcribe, patch(
+        "tools.transcription_tools.get_stt_model_from_config",
+        side_effect=AssertionError("legacy STT model helper should not be used here"),
+    ):
+        result = await runner._enrich_message_with_transcription(
+            "caption",
+            ["/tmp/voice.ogg"],
+        )
+
+    mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
+    assert "decoded" in result

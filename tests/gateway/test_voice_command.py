@@ -1064,12 +1064,21 @@ class TestDiscordVoiceChannelMethods:
         pcm_data = b"\x00" * 96000
 
         with patch("gateway.platforms.discord.VoiceReceiver.pcm_to_wav"), \
-             patch("tools.transcription_tools.transcribe_audio",
-                   return_value={"success": True, "transcript": "Hello"}), \
+             patch(
+                 "tools.transcription_tools.transcribe_audio",
+                 return_value={"success": True, "transcript": "Hello"},
+             ) as mock_transcribe, \
+             patch(
+                 "tools.transcription_tools.get_stt_model_from_config",
+                 side_effect=AssertionError("legacy STT model helper should not be used here"),
+             ), \
              patch("tools.voice_mode.is_whisper_hallucination", return_value=False):
             await adapter._process_voice_input(111, 42, pcm_data)
 
         callback.assert_called_once_with(guild_id=111, user_id=42, transcript="Hello")
+        called_wav_path = mock_transcribe.call_args.args[0]
+        assert called_wav_path.endswith(".wav")
+        assert mock_transcribe.call_args.kwargs == {}
 
     @pytest.mark.asyncio
     async def test_process_voice_input_hallucination_filtered(self):

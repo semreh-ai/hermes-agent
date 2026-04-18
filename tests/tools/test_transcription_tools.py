@@ -818,6 +818,98 @@ class TestTranscribeAudioDispatch:
 
 
 # ============================================================================
+# get_stt_model_from_config
+# ============================================================================
+
+class TestGetSttModelFromConfig:
+    def test_returns_model_from_config(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("stt:\n  model: whisper-large-v3\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() == "whisper-large-v3"
+
+    def test_returns_none_when_no_stt_section(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("tts:\n  provider: edge\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() is None
+
+    def test_returns_none_when_no_config_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() is None
+
+    def test_returns_none_on_invalid_yaml(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(": : :\n  bad yaml [[[")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() is None
+
+    def test_returns_none_when_model_key_missing(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("stt:\n  enabled: true\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() is None
+
+    def test_prefers_local_model_when_provider_is_local(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "stt:\n"
+            "  provider: local\n"
+            "  model: whisper-1\n"
+            "  local:\n"
+            "    model: base\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() == "base"
+
+
+class TestTranscribeAudioModelResolution:
+    def test_local_provider_ignores_legacy_openai_model(self, sample_wav):
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "provider": "local",
+                 "model": "whisper-1",
+                 "local": {"model": "base"},
+             }), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local", return_value={"success": True, "transcript": "ok"}) as mock_local:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        mock_local.assert_called_once_with(sample_wav, "base")
+
+    def test_openai_provider_uses_legacy_model_fallback(self, sample_wav):
+        with patch("tools.transcription_tools._validate_audio_file", return_value=None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "provider": "openai",
+                 "model": "gpt-4o-mini-transcribe",
+                 "openai": {},
+             }), \
+             patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="openai"), \
+             patch("tools.transcription_tools._transcribe_openai", return_value={"success": True, "transcript": "ok"}) as mock_openai:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_wav)
+
+        assert result["success"] is True
+        mock_openai.assert_called_once_with(sample_wav, "gpt-4o-mini-transcribe")
+
+
+# ============================================================================
 # _transcribe_mistral
 # ============================================================================
 
