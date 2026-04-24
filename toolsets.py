@@ -56,6 +56,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Oracle persona retrieval + citation validation
+    "oracle_persona_sync", "oracle_persona_search", "oracle_citation_validate",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -123,6 +125,12 @@ TOOLSETS = {
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
         "tools": ["cronjob"],
+        "includes": []
+    },
+
+    "oracle": {
+        "description": "Oracle persona retrieval with Qdrant hybrid search and strict citation validation",
+        "tools": ["oracle_persona_sync", "oracle_persona_search", "oracle_citation_validate"],
         "includes": []
     },
     

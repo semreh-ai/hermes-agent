@@ -29,7 +29,7 @@ def _ensure_discord_mock():
 
 
 import gateway.run as gateway_run
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -110,6 +110,19 @@ class TestResolveChannelPrompts:
         adapter = _make_adapter()
         adapter.config.extra = {"channel_prompts": {"100": "Research mode"}}
         assert adapter._resolve_channel_prompt("100") == "Research mode"
+
+    def test_dict_entry_uses_prompt_field(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_prompts": {
+                "100": {
+                    "label": "Oracle",
+                    "prompt": "Speak like DejaRu22.",
+                    "model": "gpt-5.4",
+                }
+            }
+        }
+        assert adapter._resolve_channel_prompt("100") == "Speak like DejaRu22."
 
     def test_numeric_yaml_keys_normalized_at_config_load(self):
         """Numeric YAML keys are normalized to strings by config bridging.
@@ -256,3 +269,55 @@ async def test_run_agent_appends_channel_prompt_to_ephemeral_system_prompt(monke
     assert _CapturingAgent.last_init["ephemeral_system_prompt"] == (
         "Context prompt\n\nChannel prompt\n\nGlobal prompt"
     )
+
+
+def test_oracle_channel_config_can_override_model_provider(monkeypatch):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="tok",
+                extra={
+                    "channel_prompts": {
+                        "1495518951139053588": {
+                            "label": "Oracle",
+                            "prompt": "This channel is Oracle.",
+                            "model": "gpt-5.4",
+                            "provider": "openai-codex",
+                        }
+                    }
+                },
+            )
+        }
+    )
+    runner._session_model_overrides = {}
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1495806168025796700",
+        chat_type="thread",
+        user_id="user-1",
+        thread_id="1495806168025796700",
+        parent_chat_id="1495518951139053588",
+    )
+
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda user_config=None: "qwen3.6-plus")
+
+    def fake_runtime_kwargs(requested_provider=None):
+        provider = requested_provider or "opencode-go"
+        return {
+            "provider": provider,
+            "api_key": f"{provider}-key",
+            "base_url": f"https://{provider}.example/api",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", fake_runtime_kwargs)
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(source=source, session_key="oracle-session")
+
+    assert model == "gpt-5.4"
+    assert runtime_kwargs["provider"] == "openai-codex"
+    assert runtime_kwargs["api_key"] == "openai-codex-key"
+    assert runtime_kwargs["base_url"] == "https://openai-codex.example/api"

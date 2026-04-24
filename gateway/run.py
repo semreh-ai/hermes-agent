@@ -348,7 +348,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(requested_provider: str | None = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -357,7 +357,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
 
     try:
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested_provider or os.getenv("HERMES_INFERENCE_PROVIDER"),
         )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
@@ -1102,6 +1102,10 @@ class GatewayRunner:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+        else:
+            model, runtime_kwargs = self._apply_channel_model_override(
+                source, model, runtime_kwargs
+            )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -1120,6 +1124,67 @@ class GatewayRunner:
                 pass
 
         return model, runtime_kwargs
+
+    def _resolve_source_channel_entry(self, source: Optional[SessionSource]) -> Optional[Dict[str, Any]]:
+        if source is None:
+            return None
+        try:
+            platform_cfg = self.config.platforms.get(source.platform)
+        except Exception:
+            return None
+        extra = getattr(platform_cfg, "extra", None)
+        if not isinstance(extra, dict):
+            return None
+
+        from gateway.platforms.base import resolve_channel_config_entry
+
+        channel_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        parent_id = str(getattr(source, "parent_chat_id", "") or "")
+
+        primary_id = thread_id or channel_id
+        entry = resolve_channel_config_entry(extra, primary_id, parent_id or None)
+        if entry:
+            return entry
+        if channel_id and channel_id != primary_id:
+            return resolve_channel_config_entry(extra, channel_id, parent_id or None)
+        return None
+
+    def _apply_channel_model_override(
+        self,
+        source: Optional[SessionSource],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        entry = self._resolve_source_channel_entry(source)
+        if not isinstance(entry, dict):
+            return model, runtime_kwargs
+
+        override_keys = (
+            "model",
+            "provider",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "command",
+            "args",
+            "credential_pool",
+        )
+        override = {key: entry.get(key) for key in override_keys if entry.get(key) is not None}
+        if not override:
+            return model, runtime_kwargs
+
+        runtime = dict(runtime_kwargs)
+        provider = override.get("provider")
+        if provider and provider != runtime.get("provider"):
+            runtime = _resolve_runtime_agent_kwargs(requested_provider=str(provider))
+
+        if override.get("model") is not None:
+            model = str(override["model"])
+        for key in ("provider", "api_key", "base_url", "api_mode", "command", "args", "credential_pool"):
+            if key in override:
+                runtime[key] = override[key]
+        return model, runtime
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
