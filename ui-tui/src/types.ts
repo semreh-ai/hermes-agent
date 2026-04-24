@@ -12,21 +12,86 @@ export interface ActivityItem {
 }
 
 export interface SubagentProgress {
+  apiCalls?: number
+  costUsd?: number
+  depth: number
   durationSeconds?: number
+  filesRead?: string[]
+  filesWritten?: string[]
   goal: string
   id: string
   index: number
+  inputTokens?: number
+  iteration?: number
+  model?: string
   notes: string[]
-  status: 'completed' | 'failed' | 'interrupted' | 'running'
+  outputTail?: SubagentOutputEntry[]
+  outputTokens?: number
+  parentId: null | string
+  reasoningTokens?: number
+  startedAt?: number
+  status: 'completed' | 'failed' | 'interrupted' | 'queued' | 'running'
   summary?: string
   taskCount: number
   thinking: string[]
+  toolCount: number
   tools: string[]
+  toolsets?: string[]
+}
+
+export interface SubagentOutputEntry {
+  isError: boolean
+  preview: string
+  tool: string
+}
+
+export interface SubagentNode {
+  aggregate: SubagentAggregate
+  children: SubagentNode[]
+  item: SubagentProgress
+}
+
+export interface SubagentAggregate {
+  activeCount: number
+  costUsd: number
+  descendantCount: number
+  filesTouched: number
+  hotness: number
+  inputTokens: number
+  maxDepthFromHere: number
+  outputTokens: number
+  totalDuration: number
+  totalTools: number
+}
+
+export interface DelegationStatus {
+  active: {
+    depth?: number
+    goal?: string
+    model?: null | string
+    parent_id?: null | string
+    started_at?: number
+    status?: string
+    subagent_id?: string
+    tool_count?: number
+  }[]
+  max_concurrent_children?: number
+  max_spawn_depth?: number
+  paused: boolean
 }
 
 export interface ApprovalReq {
   command: string
   description: string
+}
+
+export interface ConfirmReq {
+  cancelLabel?: string
+  confirmLabel?: string
+  danger?: boolean
+  detail?: string
+  onConfirm: () => void
+  title: string
 }
 
 export interface ClarifyReq {
@@ -51,8 +116,16 @@ export type Role = 'assistant' | 'system' | 'tool' | 'user'
 export type DetailsMode = 'hidden' | 'collapsed' | 'expanded'
 export type ThinkingMode = 'collapsed' | 'truncated' | 'full'
 
+export interface McpServerStatus {
+  connected: boolean
+  name: string
+  tools: number
+  transport: string
+}
+
 export interface SessionInfo {
   cwd?: string
+  mcp_servers?: McpServerStatus[]
   model: string
   release_date?: string
   skills: Record<string, string[]>
@@ -68,6 +141,7 @@ export interface Usage {
   context_max?: number
   context_percent?: number
   context_used?: number
+  cost_usd?: number
   input: number
   output: number
   total: number
