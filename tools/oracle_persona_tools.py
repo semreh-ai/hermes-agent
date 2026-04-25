@@ -32,6 +32,8 @@ DENSE_MODEL_NAME = os.getenv("ORACLE_DENSE_MODEL", "sentence-transformers/all-Mi
 SPARSE_DIM = int(os.getenv("ORACLE_SPARSE_DIM", "65536"))
 
 
+import importlib.util
+
 try:  # Optional dependency: tool check_fn will hide tools if unavailable.
     from qdrant_client import QdrantClient, models
     _HAS_QDRANT = True
@@ -40,12 +42,9 @@ except Exception:
     models = None  # type: ignore[assignment]
     _HAS_QDRANT = False
 
-try:
-    from sentence_transformers import SentenceTransformer
-    _HAS_ST = True
-except Exception:
-    SentenceTransformer = None  # type: ignore[assignment]
-    _HAS_ST = False
+# Lazy: only import sentence_transformers when actually needed.
+_HAS_ST = importlib.util.find_spec("sentence_transformers") is not None
+SentenceTransformer = None
 
 _EMBEDDER = None
 
@@ -87,10 +86,12 @@ def _sparse_encode(text: str):
 
 
 def _get_embedder():
-    global _EMBEDDER
+    global _EMBEDDER, SentenceTransformer
     if _EMBEDDER is None:
-        if not _HAS_ST or SentenceTransformer is None:
+        if not _HAS_ST:
             raise RuntimeError("sentence-transformers not installed")
+        from sentence_transformers import SentenceTransformer as _ST
+        SentenceTransformer = _ST
         _EMBEDDER = SentenceTransformer(DENSE_MODEL_NAME)
     return _EMBEDDER
 
