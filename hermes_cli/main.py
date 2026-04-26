@@ -4396,7 +4396,7 @@ def cmd_version(args):
 
     # Show update status (synchronous — acceptable since user asked for version info)
     try:
-        from hermes_cli.banner import check_for_updates
+        from hermes_cli.banner import check_for_updates, get_git_banner_state
         from hermes_cli.config import recommended_update_command
 
         behind = check_for_updates()
@@ -4408,6 +4408,17 @@ def cmd_version(args):
             )
         elif behind == 0:
             print("Up to date")
+        else:
+            state = get_git_banner_state()
+            if state and int(state.get("behind") or 0) > 0:
+                remote_ref = state.get("target_ref") or "upstream/main"
+                ahead = int(state.get("ahead") or 0)
+                remote_behind = int(state.get("behind") or 0)
+                suffix = f", +{ahead} local" if ahead else ""
+                print(
+                    f"Custom branch: {remote_behind} commits behind {remote_ref}{suffix}. "
+                    "Use staged fork sync, not 'hermes update'."
+                )
     except Exception:
         pass
 
@@ -5550,6 +5561,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Always update against main
         branch = "main"
+
+        # The generic updater cannot safely update a deployed fork/custom
+        # branch: it switches to main and may abandon local production behavior.
+        # Require a staged fork sync instead of silently moving the runtime.
+        if is_fork and current_branch != "main":
+            label = (
+                "detached HEAD"
+                if current_branch == "HEAD"
+                else f"branch '{current_branch}'"
+            )
+            print(f"✗ Refusing automatic update from fork {label}.")
+            print()
+            print("  This install carries custom Hermes behavior. Use a staged upstream sync:")
+            print("    1. git fetch upstream --tags")
+            print("    2. git worktree add -b staging/update-latest ~/projects/hermes-agent-update HEAD")
+            print("    3. cd ~/projects/hermes-agent-update && git merge --no-ff --no-commit upstream/main")
+            print("    4. resolve conflicts, run tests, then promote deliberately")
+            print()
+            print("  Production was left untouched.")
+            sys.exit(1)
 
         # If user is on a non-main branch or detached HEAD, switch to main
         if current_branch != "main":

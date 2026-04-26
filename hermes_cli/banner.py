@@ -124,20 +124,32 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 
 
 def check_for_updates() -> Optional[int]:
-    """Check how many commits behind origin/main the local repo is.
+    """Check how many commits behind the active repo is.
 
     Does a ``git fetch`` at most once every 6 hours (cached to
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
-    or ``None`` if the check fails or isn't applicable.
+    or ``None`` if the check fails or isn't safely actionable.
+
+    Fork/custom-branch installs are intentionally treated as not directly
+    actionable: the generic ``hermes update`` command switches to ``main`` and
+    is unsafe for deployed custom branches.  The banner should not recommend a
+    command that would abandon local production behavior.
     """
     hermes_home = get_hermes_home()
-    repo_dir = hermes_home / "hermes-agent"
+    repo_dir = _resolve_repo_dir()
     cache_file = hermes_home / ".update_check"
 
-    # Must be a git repo — fall back to project root for dev installs
-    if not (repo_dir / ".git").exists():
-        repo_dir = Path(__file__).parent.parent.resolve()
-    if not (repo_dir / ".git").exists():
+    if repo_dir is None:
+        return None
+
+    current_branch = _git_text(repo_dir, ["branch", "--show-current"])
+    remote = "upstream" if _git_remote_exists(repo_dir, "upstream") else "origin"
+    target_ref = f"{remote}/main"
+
+    # The generic updater only knows how to update main.  On a fork/custom
+    # branch, returning a positive behind count would print a dangerous
+    # "run hermes update" recommendation.
+    if current_branch and current_branch != "main":
         return None
 
     # Read cache
@@ -145,7 +157,12 @@ def check_for_updates() -> Optional[int]:
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+            if (
+                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+                and cached.get("repo") == str(repo_dir)
+                and cached.get("target_ref") == target_ref
+                and cached.get("branch") == current_branch
+            ):
                 return cached.get("behind")
     except Exception:
         pass
@@ -153,7 +170,7 @@ def check_for_updates() -> Optional[int]:
     # Fetch latest refs (fast — only downloads ref metadata, no files)
     try:
         subprocess.run(
-            ["git", "fetch", "origin", "--quiet"],
+            ["git", "fetch", remote, "--quiet"],
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
@@ -163,7 +180,7 @@ def check_for_updates() -> Optional[int]:
     # Count commits behind
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -176,20 +193,59 @@ def check_for_updates() -> Optional[int]:
 
     # Write cache
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
+        cache_file.write_text(json.dumps({
+            "ts": now,
+            "behind": behind,
+            "repo": str(repo_dir),
+            "target_ref": target_ref,
+            "branch": current_branch,
+        }))
     except Exception:
         pass
 
     return behind
 
 
+def _git_text(repo_dir: Path, args: list[str], timeout: float = 5) -> Optional[str]:
+    """Run a git command and return stripped stdout, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _git_remote_exists(repo_dir: Path, remote: str) -> bool:
+    return _git_text(repo_dir, ["remote", "get-url", remote]) is not None
+
+
+def _resolve_update_ref(repo_dir: Path) -> str:
+    """Prefer upstream/main when a fork has an upstream remote."""
+    return "upstream/main" if _git_remote_exists(repo_dir, "upstream") else "origin/main"
+
+
 def _resolve_repo_dir() -> Optional[Path]:
     """Return the active Hermes git checkout, or None if this isn't a git install."""
     hermes_home = get_hermes_home()
-    repo_dir = hermes_home / "hermes-agent"
-    if not (repo_dir / ".git").exists():
-        repo_dir = Path(__file__).parent.parent.resolve()
-    return repo_dir if (repo_dir / ".git").exists() else None
+    module_repo = Path(__file__).parent.parent.resolve()
+    home_repo = hermes_home / "hermes-agent"
+
+    # Prefer the checkout providing the imported code.  Forked deployments may
+    # keep an old HERMES_HOME/hermes-agent checkout around only for its venv;
+    # using that legacy path makes version/update banners report false drift.
+    for repo_dir in (module_repo, home_repo):
+        if (repo_dir / ".git").exists():
+            return repo_dir
+    return None
 
 
 def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
@@ -216,15 +272,17 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     if repo_dir is None:
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    target_ref = _resolve_update_ref(repo_dir)
+    upstream = _git_short_hash(repo_dir, target_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         return None
 
     ahead = 0
+    behind = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{target_ref}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -235,7 +293,27 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     except Exception:
         ahead = 0
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"HEAD..{target_ref}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        if result.returncode == 0:
+            behind = int((result.stdout or "0").strip() or "0")
+    except Exception:
+        behind = 0
+
+    return {
+        "upstream": upstream,
+        "local": local,
+        "ahead": max(ahead, 0),
+        "behind": max(behind, 0),
+        "target_ref": target_ref,
+        "branch": _git_text(repo_dir, ["branch", "--show-current"]),
+    }
 
 
 def format_banner_version_label() -> str:
@@ -248,8 +326,19 @@ def format_banner_version_label() -> str:
     upstream = state["upstream"]
     local = state["local"]
     ahead = int(state.get("ahead") or 0)
+    behind = int(state.get("behind") or 0)
 
-    if ahead <= 0 or upstream == local:
+    if upstream == local:
+        return f"{base} · upstream {upstream}"
+
+    if behind > 0 and ahead > 0:
+        return f"{base} · upstream {upstream} · local {local} (+{ahead}/-{behind})"
+
+    if behind > 0:
+        commits_word = "commit" if behind == 1 else "commits"
+        return f"{base} · upstream {upstream} · {behind} {commits_word} behind"
+
+    if ahead <= 0:
         return f"{base} · upstream {upstream}"
 
     carried_word = "commit" if ahead == 1 else "commits"
