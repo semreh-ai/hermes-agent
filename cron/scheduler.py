@@ -927,7 +927,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 300
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})

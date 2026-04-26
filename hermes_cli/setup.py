@@ -1515,8 +1515,8 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 90
-    save_env_value("HERMES_MAX_ITERATIONS", "90")
+    config.setdefault("agent", {})["max_turns"] = 300
+    save_env_value("HERMES_MAX_ITERATIONS", "300")
 
     config.setdefault("display", {})["tool_progress"] = "all"
 
@@ -1547,7 +1547,7 @@ def setup_agent_settings(config: dict):
 
     # ── Max Iterations ──
     current_max = get_env_value("HERMES_MAX_ITERATIONS") or str(
-        config.get("agent", {}).get("max_turns", 90)
+        config.get("agent", {}).get("max_turns", 300)
     )
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
@@ -2600,7 +2600,7 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
         return f"backend: {backend}"
 
     elif section_key == "agent":
-        max_turns = config.get("agent", {}).get("max_turns", 90)
+        max_turns = config.get("agent", {}).get("max_turns", 300)
         return f"max turns: {max_turns}"
 
     elif section_key == "gateway":
