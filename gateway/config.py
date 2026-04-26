@@ -135,7 +135,7 @@ class SessionResetPolicy:
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
-            notify=notify if notify is not None else True,
+            notify=_coerce_bool(notify, True),
             notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
         )
 
@@ -178,7 +178,7 @@ class PlatformConfig:
             home_channel = HomeChannel.from_dict(data["home_channel"])
         
         return cls(
-            enabled=data.get("enabled", False),
+            enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
             api_key=data.get("api_key"),
             home_channel=home_channel,
@@ -435,7 +435,7 @@ class GatewayConfig:
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
-            always_log_local=data.get("always_log_local", True),
+            always_log_local=_coerce_bool(data.get("always_log_local"), True),
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
@@ -570,6 +570,8 @@ def load_gateway_config() -> GatewayConfig:
                     )
                 if "reply_prefix" in platform_cfg:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
+                if "reply_in_thread" in platform_cfg:
+                    bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "free_response_channels" in platform_cfg:
@@ -609,6 +611,8 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(slack_cfg, dict):
                 if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
                     os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
+                if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
+                    os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
                 if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
                     os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
                 frc = slack_cfg.get("free_response_channels")
@@ -687,6 +691,11 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+                if "group_allowed_chats" in telegram_cfg and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
+                    gac = telegram_cfg["group_allowed_chats"]
+                    if isinstance(gac, list):
+                        gac = ",".join(str(v) for v in gac)
+                    os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(gac)
                 if "disable_link_previews" in telegram_cfg:
                     plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
                     if not isinstance(plat_data, dict):

@@ -248,7 +248,6 @@ Type these during an interactive chat session.
 ```
 /config              Show config (CLI)
 /model [name]        Show or change model
-/provider            Show provider info
 /personality [name]  Set personality
 /reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|show|hide)
 /verbose             Cycle: off → new → all → verbose
@@ -282,7 +281,6 @@ Type these during an interactive chat session.
 ### Utility
 ```
 /branch (/fork)      Branch the current session
-/btw                 Ephemeral side question (doesn't interrupt main task)
 /fast                Toggle priority/fast processing
 /browser             Open CDP browser connection
 /history             Show conversation history (CLI)
