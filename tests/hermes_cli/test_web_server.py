@@ -1938,6 +1938,44 @@ class TestPtyWebSocket:
         assert "channel=abc-123" in url
         assert "token=" in url
 
+    def test_wildcard_bind_sidecar_uses_loopback_connect_target(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_resolve(resume=None, sidecar_url=None):
+            captured["sidecar_url"] = sidecar_url
+            return (["/bin/sh", "-c", "printf sidecar-ok"], None, None)
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_host", "0.0.0.0", raising=False
+        )
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_port", 9119, raising=False
+        )
+
+        with self.client.websocket_connect(self._url(channel="abc-123")) as conn:
+            try:
+                conn.receive_bytes()
+            except Exception:
+                pass
+
+        assert (captured.get("sidecar_url") or "").startswith(
+            "ws://127.0.0.1:9119/api/pub?"
+        )
+
+    def test_ws_non_loopback_client_allowed_only_for_wildcard_bind(self, monkeypatch):
+        assert not self.ws_module._is_accepted_ws_client("100.64.131.115")
+
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_host", "0.0.0.0", raising=False
+        )
+        assert self.ws_module._is_accepted_ws_client("100.64.131.115")
+
+        monkeypatch.setattr(
+            self.ws_module.app.state, "bound_host", "127.0.0.1", raising=False
+        )
+        assert not self.ws_module._is_accepted_ws_client("100.64.131.115")
+
     def test_pub_broadcasts_to_events_subscribers(self, monkeypatch):
         """Frame written to /api/pub is rebroadcast verbatim to every
         /api/events subscriber on the same channel."""

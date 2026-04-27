@@ -2297,6 +2297,27 @@ _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
+
+def _is_accepted_ws_client(client_host: str) -> bool:
+    """True when a dashboard WebSocket client may connect.
+
+    The dashboard normally binds to loopback only, so WebSocket endpoints were
+    originally loopback-only as a second defence layer. Operators can
+    explicitly opt into non-loopback exposure with ``hermes dashboard
+    --host 0.0.0.0 --insecure`` — typically behind a trusted private proxy such
+    as Tailscale Serve. In that mode the HTTP Host middleware already treats
+    the wildcard bind as intentional; mirror that decision for WS upgrades so
+    the Chat tab can work through the proxy.
+    """
+    if not client_host:
+        return True
+    if client_host in _LOOPBACK_HOSTS:
+        return True
+
+    bound_host = getattr(app.state, "bound_host", None)
+    return bound_host in ("0.0.0.0", "::")
+
+
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
 # the chat tab generates on mount; entries auto-evict when the last subscriber
@@ -2349,7 +2370,12 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     if not host or not port:
         return None
 
-    netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+    # ``0.0.0.0``/``::`` are listen addresses, not useful connect targets for
+    # the child TUI process. When the dashboard is exposed through a private
+    # proxy (for example Tailscale Serve), the sidecar still runs on the same
+    # host, so loop back explicitly.
+    connect_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    netloc = f"[{connect_host}]:{port}" if ":" in connect_host and not connect_host.startswith("[") else f"{connect_host}:{port}"
     qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
 
     return f"ws://{netloc}/api/pub?{qs}"
@@ -2390,7 +2416,7 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     client_host = ws.client.host if ws.client else ""
-    if client_host and client_host not in _LOOPBACK_HOSTS:
+    if not _is_accepted_ws_client(client_host):
         await ws.close(code=4403)
         return
 
@@ -2498,7 +2524,7 @@ async def gateway_ws(ws: WebSocket) -> None:
         return
 
     client_host = ws.client.host if ws.client else ""
-    if client_host and client_host not in _LOOPBACK_HOSTS:
+    if not _is_accepted_ws_client(client_host):
         await ws.close(code=4403)
         return
 
@@ -2531,7 +2557,7 @@ async def pub_ws(ws: WebSocket) -> None:
         return
 
     client_host = ws.client.host if ws.client else ""
-    if client_host and client_host not in _LOOPBACK_HOSTS:
+    if not _is_accepted_ws_client(client_host):
         await ws.close(code=4403)
         return
 
@@ -2561,7 +2587,7 @@ async def events_ws(ws: WebSocket) -> None:
         return
 
     client_host = ws.client.host if ws.client else ""
-    if client_host and client_host not in _LOOPBACK_HOSTS:
+    if not _is_accepted_ws_client(client_host):
         await ws.close(code=4403)
         return
 
