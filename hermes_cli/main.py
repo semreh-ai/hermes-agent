@@ -7649,8 +7649,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # No upstream changes — fall through to normal origin check below
 
 
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
+        # If user is on a non-main branch or detached HEAD, switch to main.
+        # On forks, stay on the current branch — main may not be meaningful.
+        if current_branch != "main" and not is_fork:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
