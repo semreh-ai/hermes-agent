@@ -6644,8 +6644,11 @@ def _fork_auto_merge_upstream(
 
     if merge_result.returncode != 0:
         print("✗ Merge conflict detected. Aborting merge.")
-        stderr_short = merge_result.stderr.strip()[:500] if merge_result.stderr else "(no stderr)"
-        print(f"  {stderr_short}")
+        # Show both stdout and stderr — git writes conflict info to stdout
+        output = (merge_result.stdout.strip() + "\n" + merge_result.stderr.strip()).strip()
+        for line in output.splitlines()[-15:]:  # last 15 lines usually have the conflict summary
+            if "CONFLICT" in line or "Automatic merge failed" in line or "fix conflicts" in line:
+                print(f"  {line}")
         subprocess.run(git_cmd + ["merge", "--abort"], cwd=cwd, capture_output=True)
         if auto_stash_ref is not None:
             _restore_stashed_changes(
