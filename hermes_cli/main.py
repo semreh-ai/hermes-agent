@@ -289,7 +289,7 @@ def _has_any_provider_configured() -> bool:
     env_file = get_env_path()
     if env_file.exists():
         try:
-            for line in env_file.read_text().splitlines():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line.startswith("#") or "=" not in line:
                     continue
@@ -800,6 +800,8 @@ def _print_tui_exit_summary(session_id: Optional[str], active_session_file: Opti
 
         title = db.get_session_title(target)
         message_count = int(session.get("message_count") or 0)
+        if message_count == 0:
+            return  # No real conversation — don't show resume info
         input_tokens = int(session.get("input_tokens") or 0)
         output_tokens = int(session.get("output_tokens") or 0)
         cache_read_tokens = int(session.get("cache_read_tokens") or 0)
@@ -1927,6 +1929,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("mcp",              "MCP",              "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
     ("skills_hub",       "Skills hub",       "skills search/install"),
+    ("curator",          "Curator",          "skill-usage review pass"),
 ]
 
 
@@ -5040,6 +5043,13 @@ def cmd_slack(args):
     return 1
 
 
+def cmd_kanban(args):
+    """Multi-profile collaboration board."""
+    from hermes_cli.kanban import kanban_command
+
+    return kanban_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -5111,7 +5121,7 @@ def cmd_version(args):
 
     # Show update status (synchronous — acceptable since user asked for version info)
     try:
-        from hermes_cli.banner import check_for_updates, get_git_banner_state
+        from hermes_cli.banner import check_for_updates
         from hermes_cli.config import recommended_update_command
 
         behind = check_for_updates()
@@ -5123,17 +5133,6 @@ def cmd_version(args):
             )
         elif behind == 0:
             print("Up to date")
-        else:
-            state = get_git_banner_state()
-            if state and int(state.get("behind") or 0) > 0:
-                remote_ref = state.get("target_ref") or "upstream/main"
-                ahead = int(state.get("ahead") or 0)
-                remote_behind = int(state.get("behind") or 0)
-                suffix = f", +{ahead} local" if ahead else ""
-                print(
-                    f"Custom branch: {remote_behind} commits behind {remote_ref}{suffix}. "
-                    "Use staged fork sync, not 'hermes update'."
-                )
     except Exception:
         pass
 
@@ -5346,8 +5345,8 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     return True
 
 
-def _warn_stale_dashboard_processes() -> None:
-    """Warn about running dashboard processes that still hold pre-update code.
+def _find_stale_dashboard_pids() -> list[int]:
+    """Return PIDs of ``hermes dashboard`` processes other than ourselves.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
     forgotten.  When ``hermes update`` replaces files on disk, the running
@@ -5355,9 +5354,13 @@ def _warn_stale_dashboard_processes() -> None:
     disk is updated, causing a silent frontend/backend mismatch (e.g. new
     auth headers the old backend doesn't recognise → every API call 401s).
 
-    Unlike the gateway, the dashboard has no service manager (systemd /
-    launchd), so we can only warn — we don't auto-kill user-managed
-    background processes.
+    The dashboard has no service manager (systemd / launchd), no PID file,
+    and we can't know the original launch args — so the only sane action
+    after an update is to kill the stale process and let the user restart
+    it.  This helper is just the detection step; see
+    ``_kill_stale_dashboard_processes`` for the kill.
+
+    Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
     patterns = [
         "hermes dashboard",
@@ -5383,7 +5386,7 @@ def _warn_stale_dashboard_processes() -> None:
                 encoding="utf-8", errors="ignore",
             )
             if result.returncode != 0 or result.stdout is None:
-                return
+                return []
             current_cmd = ""
             for line in result.stdout.split("\n"):
                 line = line.strip()
@@ -5425,20 +5428,151 @@ def _warn_stale_dashboard_processes() -> None:
                             and pid != self_pid):
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return
+        return []
 
-    if not dashboard_pids:
+    return dashboard_pids
+
+
+def _print_curator_first_run_notice() -> None:
+    """Print a short heads-up about the skill curator after `hermes update`.
+
+    Only fires when the curator is enabled AND has no recorded run yet, which
+    is exactly the window where the gateway ticker used to fire Curator
+    against a fresh skill library immediately after an update. We defer the
+    first real pass by one ``interval_hours``; this notice tells the user how
+    to preview or disable before then. Silent on steady state.
+    """
+    try:
+        from agent import curator
+    except Exception:
+        return
+    try:
+        if not curator.is_enabled():
+            return
+        state = curator.load_state()
+    except Exception:
+        return
+    if state.get("last_run_at"):
+        # Curator has run before (real or already seeded) — no notice needed.
+        return
+    try:
+        hours = curator.get_interval_hours()
+    except Exception:
+        hours = 24 * 7
+    days = max(1, hours // 24)
+    print()
+    print("ℹ Skill curator")
+    print(
+        f"  Background skill maintenance is enabled. First pass is deferred "
+        f"~{days}d after installation; only agent-created skills are in "
+        f"scope and nothing is ever auto-deleted (archive is recoverable)."
+    )
+    print("  Preview now:  hermes curator run --dry-run")
+    print("  Pause it:     hermes curator pause")
+    print("  Docs:         https://hermes-agent.nousresearch.com/docs/user-guide/features/curator")
+
+
+def _kill_stale_dashboard_processes(
+    reason: str = "the running backend no longer matches the updated frontend",
+) -> None:
+    """Kill running ``hermes dashboard`` processes.
+
+    Called at the end of ``hermes update`` (default ``reason``) and also
+    from ``hermes dashboard --stop`` (which overrides ``reason``).  The
+    dashboard has no service manager, so after a code update the running
+    process is guaranteed to be serving stale Python against a
+    freshly-updated JS bundle.  Leaving it alive produces silent
+    frontend/backend mismatches (new auth headers the old backend doesn't
+    recognise → every API call 401s).
+
+    POSIX: SIGTERM, wait up to ~3s for graceful exit, SIGKILL any survivors.
+    Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
+    equivalent for background console apps.
+
+    The dashboard isn't auto-restarted because we don't know the original
+    launch args (--host, --port, --insecure, --tui, --no-open).  The user
+    restarts it manually; a hint is printed.
+    """
+    pids = _find_stale_dashboard_pids()
+    if not pids:
         return
 
     print()
-    print(f"⚠ {len(dashboard_pids)} dashboard process(es) still running "
-          f"with the previous version:")
-    for pid in dashboard_pids:
-        print(f"    PID {pid}")
-    print("  The running backend may not match the updated frontend,")
-    print("  causing silent auth failures or empty data.")
-    print("  Restart them to pick up the changes:")
-    print("    kill <pid> && hermes dashboard --port <port> ...")
+    print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
+
+    killed: list[int] = []
+    failed: list[tuple[int, str]] = []
+
+    if sys.platform == "win32":
+        for pid in pids:
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    killed.append(pid)
+                else:
+                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+                failed.append((pid, str(e)))
+    else:
+        import signal as _signal
+        import time as _time
+
+        # SIGTERM first — give each process a chance to shut down cleanly
+        # (uvicorn closes its socket, flushes logs, etc.).
+        for pid in pids:
+            try:
+                os.kill(pid, _signal.SIGTERM)
+            except ProcessLookupError:
+                # Already gone — count as killed.
+                killed.append(pid)
+            except (PermissionError, OSError) as e:
+                failed.append((pid, str(e)))
+
+        # Poll for exit up to ~3s total.
+        deadline = _time.monotonic() + 3.0
+        pending = [p for p in pids if p not in killed
+                   and p not in {f[0] for f in failed}]
+        while pending and _time.monotonic() < deadline:
+            _time.sleep(0.1)
+            still_pending = []
+            for pid in pending:
+                try:
+                    os.kill(pid, 0)  # probe
+                except ProcessLookupError:
+                    killed.append(pid)
+                except (PermissionError, OSError):
+                    # Can't probe — assume still there.
+                    still_pending.append(pid)
+                else:
+                    still_pending.append(pid)
+            pending = still_pending
+
+        # SIGKILL any survivors.
+        for pid in pending:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                killed.append(pid)
+            except ProcessLookupError:
+                killed.append(pid)
+            except (PermissionError, OSError) as e:
+                failed.append((pid, str(e)))
+
+    for pid in killed:
+        print(f"    ✓ stopped PID {pid}")
+    for pid, reason in failed:
+        print(f"    ✗ failed to stop PID {pid}: {reason}")
+
+    if killed:
+        print("  Restart the dashboard when you're ready:")
+        print("    hermes dashboard --port <port>")
+
+
+# Back-compat alias: some tests and any external callers may import the old
+# warn-only name.  The new behaviour (kill stale processes) replaces it.
+_warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 
 def _update_via_zip(args):
@@ -5575,7 +5709,11 @@ def _update_via_zip(args):
 
     print()
     print("✓ Update complete!")
-    _warn_stale_dashboard_processes()
+    try:
+        _print_curator_first_run_notice()
+    except Exception as e:
+        logger.debug("Curator first-run notice failed: %s", e)
+    _kill_stale_dashboard_processes()
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -6542,36 +6680,6 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
-def cmd_update(args):
-    """Update Hermes Agent to the latest version.
-
-    Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
-    runs the update, then restores stdio on the way out (even on
-    ``sys.exit`` or unhandled exceptions).
-    """
-    from hermes_cli.config import is_managed, managed_error
-
-    if is_managed():
-        managed_error("update Hermes Agent")
-        return
-
-    if getattr(args, "check", False):
-        _cmd_update_check()
-        return
-
-    gateway_mode = getattr(args, "gateway", False)
-
-    # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
-    # writes to a closed stdout.  No-op in gateway mode.  See
-    # _install_hangup_protection for rationale.
-    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
-    try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
-    finally:
-        _finalize_update_output(_update_io_state)
-
-
-
 def _fork_auto_merge_upstream(
     git_cmd: list[str],
     cwd,
@@ -6615,11 +6723,7 @@ def _fork_auto_merge_upstream(
         print("✓ Already up to date with upstream/main")
         return False
 
-    label = (
-        "detached HEAD"
-        if current_branch == "HEAD"
-        else f"branch '{current_branch}'"
-    )
+    label = ("detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'")
     print(f"→ Upstream is {behind} commit(s) ahead — merging into {label}...")
 
     auto_stash_ref = _stash_local_changes_if_needed(git_cmd, cwd)
@@ -6637,16 +6741,13 @@ def _fork_auto_merge_upstream(
 
     merge_result = subprocess.run(
         git_cmd + ["merge", "upstream/main", "--no-edit"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
+        cwd=cwd, capture_output=True, text=True,
     )
 
     if merge_result.returncode != 0:
         print("✗ Merge conflict detected. Aborting merge.")
-        # Show both stdout and stderr — git writes conflict info to stdout
         output = (merge_result.stdout.strip() + "\n" + merge_result.stderr.strip()).strip()
-        for line in output.splitlines()[-15:]:  # last 15 lines usually have the conflict summary
+        for line in output.splitlines()[-15:]:
             if "CONFLICT" in line or "Automatic merge failed" in line or "fix conflicts" in line:
                 print(f"  {line}")
         subprocess.run(git_cmd + ["merge", "--abort"], cwd=cwd, capture_output=True)
@@ -6699,6 +6800,7 @@ def _fork_auto_merge_upstream(
     )
 
     return True
+
 
 
 def _run_post_update_steps(
@@ -6873,7 +6975,10 @@ def _run_post_update_steps(
             print(f"  ℹ️  {len(missing_config)} new config option(s) available")
 
         print()
-        if gateway_mode:
+        if assume_yes:
+            print("  ℹ --yes: auto-applying config migration (skipping API-key prompts).")
+            response = "y"
+        elif gateway_mode:
             response = (
                 _gateway_prompt(
                     "Would you like to configure new options now? [Y/n]", "n"
@@ -6899,14 +7004,17 @@ def _run_post_update_steps(
 
         if response in ("", "y", "yes"):
             print()
-            # In gateway mode, run auto-migrations only (no input() prompts
-            # for API keys which would hang the detached process).
-            results = migrate_config(interactive=not gateway_mode, quiet=False)
+            # In gateway mode OR under --yes, run auto-migrations only (no
+            # input() prompts for API keys which would hang the detached
+            # process / defeat the point of --yes).
+            results = migrate_config(
+                interactive=not (gateway_mode or assume_yes), quiet=False
+            )
 
             if results["env_added"] or results["config_added"]:
                 print()
                 print("✓ Configuration updated!")
-            if gateway_mode and missing_env:
+            if (gateway_mode or assume_yes) and missing_env:
                 print("  ℹ API keys require manual entry: hermes config migrate")
         else:
             print()
@@ -6916,6 +7024,15 @@ def _run_post_update_steps(
 
     print()
     print("✓ Update complete!")
+
+    # Curator first-run heads-up. Only prints when curator is enabled AND
+    # has never run — i.e. the window where the ticker would otherwise
+    # have fired against a fresh skill library. Kept silent on steady
+    # state so we don't nag.
+    try:
+        _print_curator_first_run_notice()
+    except Exception as e:
+        logger.debug("Curator first-run notice failed: %s", e)
 
     # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
     # for non-login interactive shells.  No-op on every other platform.
@@ -6956,6 +7073,8 @@ def _run_post_update_steps(
             supports_systemd_services,
             _ensure_user_systemd_env,
             find_gateway_pids,
+            find_profile_gateway_processes,
+            launch_detached_profile_gateway_restart,
             _get_service_pids,
             _graceful_restart_via_sigusr1,
         )
@@ -7059,6 +7178,7 @@ def _run_post_update_steps(
 
         restarted_services = []
         killed_pids = set()
+        relaunched_profiles = []
 
         # --- Systemd services (Linux) ---
         # Discover all hermes-gateway* units (default + profiles)
@@ -7248,7 +7368,33 @@ def _run_post_update_steps(
         manual_pids = find_gateway_pids(
             exclude_pids=service_pids, all_profiles=True
         )
+        profile_processes = {
+            proc.pid: proc
+            for proc in find_profile_gateway_processes(exclude_pids=service_pids)
+            if proc.pid in manual_pids
+        }
+        for pid, proc in profile_processes.items():
+            if not launch_detached_profile_gateway_restart(proc.profile, pid):
+                continue
+            # Prefer a graceful SIGUSR1 drain so in-flight agent runs
+            # finish before the watcher respawns the gateway.  If the
+            # gateway doesn't support SIGUSR1 or doesn't exit within
+            # the drain budget, fall back to SIGTERM — the watcher
+            # still sees the exit and relaunches either way.
+            drained = _graceful_restart_via_sigusr1(
+                pid, drain_timeout=_drain_budget,
+            )
+            if not drained:
+                try:
+                    os.kill(pid, _signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            killed_pids.add(pid)
+            relaunched_profiles.append(proc.profile)
+
         for pid in manual_pids:
+            if pid in profile_processes:
+                continue
             try:
                 os.kill(pid, _signal.SIGTERM)
                 killed_pids.add(pid)
@@ -7259,11 +7405,14 @@ def _run_post_update_steps(
             print()
             for svc in restarted_services:
                 print(f"  ✓ Restarted {svc}")
-            if killed_pids:
-                print(f"  → Stopped {len(killed_pids)} manual gateway process(es)")
+            if relaunched_profiles:
+                names = ", ".join(relaunched_profiles)
+                print(f"  ✓ Restarting manual gateway profile(s): {names}")
+            unmapped_count = len(killed_pids) - len(relaunched_profiles)
+            if unmapped_count:
+                print(f"  → Stopped {unmapped_count} manual gateway process(es)")
                 print("    Restart manually: hermes gateway run")
-                # Also restart for each profile if needed
-                if len(killed_pids) > 1:
+                if unmapped_count > 1:
                     print(
                         "    (or: hermes -p <profile> gateway run  for each profile)"
                     )
@@ -7271,6 +7420,42 @@ def _run_post_update_steps(
         if not restarted_services and not killed_pids:
             # No gateways were running — nothing to do
             pass
+
+        # --- Post-restart survivor sweep -----------------------------
+        # Issue #17648: some gateways ignore SIGTERM (stuck drain,
+        # blocked I/O, PID dead but zombie).  The detached profile
+        # watchers wait 120s for the old PID to exit — if it never
+        # does, no respawn happens and the user keeps hitting
+        # ImportError against a stale sys.modules.  Give the
+        # graceful paths a brief window to complete, then SIGKILL
+        # any remaining pre-update PIDs so the watcher / service
+        # manager can relaunch with fresh code.
+        try:
+            _time.sleep(3.0)
+            _service_pids_after = _get_service_pids()
+            _surviving = find_gateway_pids(
+                exclude_pids=_service_pids_after, all_profiles=True,
+            )
+            # Scope to PIDs we already tried to kill during this
+            # update (killed_pids).  Anything new is a gateway that
+            # started AFTER our restart attempt — respecting user
+            # intent, we don't kill those.
+            _stuck = [pid for pid in _surviving if pid in killed_pids]
+            if _stuck:
+                print()
+                print(
+                    f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+                )
+                for pid in _stuck:
+                    try:
+                        os.kill(pid, _signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                # Give the OS a beat to reap the processes so the
+                # watchers see them exit and respawn.
+                _time.sleep(1.5)
+        except Exception as _sweep_exc:
+            logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
     except Exception as e:
         logger.debug("Gateway restart during update failed: %s", e)
@@ -7304,14 +7489,45 @@ def _run_post_update_steps(
     except Exception as e:
         logger.debug("Legacy unit check during update failed: %s", e)
 
-    # Warn about stale dashboard processes — the dashboard has no
-    # service manager, so we can only tell the user to restart them.
-    _warn_stale_dashboard_processes()
+    # Kill stale dashboard processes — the dashboard has no service
+    # manager, so leaving it alive after a code update produces a
+    # silent frontend/backend mismatch.  We can't auto-restart it
+    # (no saved launch args) but we can stop it, and a hint is
+    # printed for the user to re-launch.
+    _kill_stale_dashboard_processes()
 
     print()
     print("Tip: You can now select a provider and model:")
     print("  hermes model              # Select provider and model")
 
+
+def cmd_update(args):
+    """Update Hermes Agent to the latest version.
+
+    Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
+    runs the update, then restores stdio on the way out (even on
+    ``sys.exit`` or unhandled exceptions).
+    """
+    from hermes_cli.config import is_managed, managed_error
+
+    if is_managed():
+        managed_error("update Hermes Agent")
+        return
+
+    if getattr(args, "check", False):
+        _cmd_update_check()
+        return
+
+    gateway_mode = getattr(args, "gateway", False)
+
+    # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
+    # writes to a closed stdout.  No-op in gateway mode.  See
+    # _install_hangup_protection for rationale.
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        _cmd_update_impl(args, gateway_mode=gateway_mode)
+    finally:
+        _finalize_update_output(_update_io_state)
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -7323,6 +7539,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if gateway_mode
         else None
     )
+    assume_yes = bool(getattr(args, "yes", False))
 
     print("⚕ Updating Hermes Agent...")
     print()
@@ -7452,8 +7669,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
-        prompt_for_restore = auto_stash_ref is not None and (
-            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
+        prompt_for_restore = (
+            auto_stash_ref is not None
+            and not assume_yes
+            and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
         # Check if there are updates
@@ -7561,6 +7780,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             auto_stash_ref=auto_stash_ref, prompt_for_restore=prompt_for_restore,
             current_branch=current_branch, is_fork=is_fork, branch=branch,
         )
+
 
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
@@ -7755,7 +7975,7 @@ def cmd_profile(args):
                 if clone_all:
                     print(f"Full copy from {source_label}.")
                 else:
-                    print(f"Cloned config, .env, SOUL.md from {source_label}.")
+                    print(f"Cloned config, .env, SOUL.md, and skills from {source_label}.")
 
             # Auto-clone Honcho config for the new profile (only with --clone/--clone-all)
             if clone or clone_all:
@@ -7947,8 +8167,59 @@ def cmd_profile(args):
             sys.exit(1)
 
 
+def _report_dashboard_status() -> int:
+    """Print ``hermes dashboard`` PIDs and return the count.
+
+    Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
+    current process is excluded, but since ``hermes dashboard --status``
+    runs in a short-lived CLI process that never matches the pattern,
+    the exclusion is irrelevant here).
+    """
+    pids = _find_stale_dashboard_pids()
+    if not pids:
+        print("No hermes dashboard processes running.")
+        return 0
+
+    print(f"{len(pids)} hermes dashboard process(es) running:")
+    for pid in pids:
+        # Best-effort: show the full cmdline so users can tell profiles apart.
+        cmdline = ""
+        try:
+            if sys.platform != "win32":
+                cmdline_path = f"/proc/{pid}/cmdline"
+                if os.path.exists(cmdline_path):
+                    with open(cmdline_path, "rb") as f:
+                        cmdline = f.read().replace(b"\x00", b" ").decode(
+                            "utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            pass
+        if cmdline:
+            print(f"    PID {pid}: {cmdline}")
+        else:
+            print(f"    PID {pid}")
+    return len(pids)
+
+
 def cmd_dashboard(args):
-    """Start the web UI server."""
+    """Start the web UI server, or (with --stop/--status) manage running ones."""
+    # --status: report running dashboards and exit, no deps needed.
+    if getattr(args, "status", False):
+        count = _report_dashboard_status()
+        sys.exit(0 if count == 0 else 0)  # status is informational, always 0
+
+    # --stop: kill any running dashboards and exit, no deps needed.
+    if getattr(args, "stop", False):
+        pids = _find_stale_dashboard_pids()
+        if not pids:
+            print("No hermes dashboard processes running.")
+            sys.exit(0)
+        # Reuse the same SIGTERM-grace-SIGKILL path used after `hermes update`.
+        _kill_stale_dashboard_processes(reason="requested via --stop")
+        # _kill_stale_dashboard_processes prints outcomes itself.  Exit 0 if
+        # we killed at least one, 1 if they were all unkillable.
+        remaining = _find_stale_dashboard_pids()
+        sys.exit(1 if remaining else 0)
+
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
@@ -8661,6 +8932,13 @@ def main():
     )
 
     webhook_parser.set_defaults(func=cmd_webhook)
+
+    # =========================================================================
+    # kanban command — multi-profile collaboration board
+    # =========================================================================
+    from hermes_cli.kanban import build_parser as _build_kanban_parser
+    kanban_parser = _build_kanban_parser(subparsers)
+    kanban_parser.set_defaults(func=cmd_kanban)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management
@@ -9869,6 +10147,13 @@ Examples:
         default=False,
         help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup)",
     )
+    update_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+    )
     update_parser.set_defaults(func=cmd_update)
 
     # =========================================================================
@@ -10045,6 +10330,22 @@ Examples:
             "Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). "
             "Alternatively set HERMES_DASHBOARD_TUI=1."
         ),
+    )
+    # Lifecycle flags — mutually exclusive with each other and with the
+    # start-a-server flags above (if both are passed, --stop / --status win
+    # because they exit before the server is started).  The dashboard has
+    # no service manager and no PID file, so these scan the process table
+    # for `hermes dashboard` cmdlines and SIGTERM them directly — the same
+    # path `hermes update` uses to clean up stale dashboards.
+    dashboard_parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop all running hermes dashboard processes and exit",
+    )
+    dashboard_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="List running hermes dashboard processes and exit",
     )
     dashboard_parser.set_defaults(func=cmd_dashboard)
 
