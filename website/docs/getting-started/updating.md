@@ -34,6 +34,34 @@ When you run `hermes update`, the following steps occur:
 
 Want to know if you're behind `origin/main` before actually pulling? Run `hermes update --check` — it fetches, prints your local commit and the latest remote commit side-by-side, and exits `0` if in sync or `1` if behind. No files are modified, no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".
 
+### Customized forks: `--auto-resolve-conflicts`
+
+If you run Hermes from a customized fork branch, opt into automated upstream conflict handling:
+
+```bash
+hermes update --auto-resolve-conflicts
+```
+
+Or make it the default:
+
+```yaml
+# ~/.hermes/config.yaml
+updates:
+  auto_resolve_conflicts: true
+```
+
+When `upstream/main` conflicts with your custom branch, Hermes creates an isolated staging worktree, asks a restricted resolver agent to fix the staging copy, runs verification, and only then fast-forwards the live checkout. Failed resolutions keep the staging worktree for inspection and leave the live checkout unmerged.
+
+Useful verification overrides:
+
+```yaml
+updates:
+  conflict_resolver:
+    verify_commands:
+      - "python -m py_compile hermes_cli/main.py"
+      - "python -m pytest -q tests/hermes_cli/test_cmd_update.py"
+```
+
 ### Full pre-update backup: `--backup`
 
 For high-value profiles (production gateways, shared team installs) you can opt into a full pre-pull backup of `HERMES_HOME` (config, auth, sessions, skills, pairing):

@@ -1292,6 +1292,22 @@ DEFAULT_CONFIG = {
         # disable backups entirely, set ``pre_update_backup: false`` above
         # rather than ``backup_keep: 0``.
         "backup_keep": 5,
+        # When enabled, customized fork branches use an isolated staging
+        # worktree plus a Hermes resolver agent for upstream merge conflicts.
+        # The live checkout is only fast-forwarded after verification passes.
+        "auto_resolve_conflicts": False,
+        "conflict_resolver": {
+            "worktree_parent": "",
+            "keep_failed_worktree": True,
+            "max_turns": 40,
+            "timeout_seconds": 900,
+            "verify_timeout_seconds": 300,
+            "toolsets": ["terminal", "file"],
+            "verify_commands": [
+                "python -m py_compile hermes_cli/main.py",
+                "python -m pytest -q tests/hermes_cli/test_cmd_update.py",
+            ],
+        },
     },
 
     # Config schema version - bump this when adding new required fields
