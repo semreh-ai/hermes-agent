@@ -3117,6 +3117,13 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     await ws.accept()
+    # Give the ASGI server one event-loop turn to flush the HTTP 101 before
+    # starting the PTY child. Without this, real uvicorn clients can see the
+    # connection close during the opening handshake when the child exits or
+    # writes immediately; Starlette's in-process TestClient does not catch it.
+    await asyncio.sleep(0)
+
+    loop = asyncio.get_running_loop()
 
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
@@ -3131,9 +3138,10 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-
     try:
-        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+        bridge = await loop.run_in_executor(
+            None, lambda: PtyBridge.spawn(argv, cwd=cwd, env=env)
+        )
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
@@ -3142,8 +3150,6 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
-
-    loop = asyncio.get_running_loop()
 
     # --- reader task: PTY master → WebSocket ----------------------------
     async def pump_pty_to_ws() -> None:
