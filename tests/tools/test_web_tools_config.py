@@ -569,7 +569,11 @@ class TestWebSearchSearxng:
         assert result["data"]["web"][0]["url"] == "https://r.com"
         mock_get.assert_called_once()
         assert mock_get.call_args.args[0] == "http://127.0.0.1:8892/search"
-        assert mock_get.call_args.kwargs["params"] == {"q": "test query", "format": "json"}
+        assert mock_get.call_args.kwargs["params"] == {
+            "q": "test query",
+            "format": "json",
+            "pageno": 1,
+        }
 
 
 class TestCheckWebApiKey:
