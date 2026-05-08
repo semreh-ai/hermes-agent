@@ -959,18 +959,52 @@ def init_db(
     return path
 
 
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return all known columns for ``table`` including hidden/generated ones."""
+    return {row["name"] for row in conn.execute(f"PRAGMA table_xinfo({table})")}
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    ddl: str,
+) -> bool:
+    """Add a column if absent, tolerating concurrent migration races.
+
+    SQLite has no portable ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``. The
+    gateway and Kanban dispatcher can open the same DB from multiple processes
+    during restart, so another process may add the column between our PRAGMA
+    check and ALTER statement. Treat that duplicate-column error as success.
+    """
+    if column in _column_names(conn, table):
+        return False
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        return True
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" in str(exc).lower():
+            return False
+        raise
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    cols = _column_names(conn, "tasks")
     if "tenant" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN tenant TEXT")
+        _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT")
+        _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "idempotency_key" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "idempotency_key",
+            "idempotency_key TEXT",
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
             "ON tasks(idempotency_key)"
@@ -993,37 +1027,69 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # the *original* snapshot; this is intentional and safe as long as
     # no step depends on a column added by a previous step in the same call.
     if "consecutive_failures" not in cols:
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN consecutive_failures "
-            "INTEGER NOT NULL DEFAULT 0"
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "consecutive_failures",
+            "consecutive_failures INTEGER NOT NULL DEFAULT 0",
         )
         if "spawn_failures" in cols:
             conn.execute(
                 "UPDATE tasks SET consecutive_failures = COALESCE(spawn_failures, 0)"
             )
     if "worker_pid" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN worker_pid INTEGER")
+        _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
     if "last_failure_error" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "last_failure_error",
+            "last_failure_error TEXT",
+        )
         if "last_spawn_error" in cols:
             conn.execute(
                 "UPDATE tasks SET last_failure_error = last_spawn_error"
             )
     if "max_runtime_seconds" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN max_runtime_seconds INTEGER")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "max_runtime_seconds",
+            "max_runtime_seconds INTEGER",
+        )
     if "last_heartbeat_at" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_heartbeat_at INTEGER")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "last_heartbeat_at",
+            "last_heartbeat_at INTEGER",
+        )
     if "current_run_id" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN current_run_id INTEGER")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "current_run_id",
+            "current_run_id INTEGER",
+        )
     if "workflow_template_id" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN workflow_template_id TEXT")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workflow_template_id",
+            "workflow_template_id TEXT",
+        )
     if "current_step_key" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN current_step_key TEXT")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "current_step_key",
+            "current_step_key TEXT",
+        )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker (additive to the built-in `kanban-worker`). NULL is fine
         # for existing rows.
-        conn.execute("ALTER TABLE tasks ADD COLUMN skills TEXT")
+        _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
 
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
@@ -1031,13 +1097,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # config, then ``DEFAULT_FAILURE_LIMIT``. Existing rows get NULL,
         # which is the correct default (they keep the global behaviour
         # they were getting before the column existed).
-        conn.execute("ALTER TABLE tasks ADD COLUMN max_retries INTEGER")
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "max_retries",
+            "max_retries INTEGER",
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
-    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    ev_cols = _column_names(conn, "task_events")
     if "run_id" not in ev_cols:
-        conn.execute("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
+        _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_run "
             "ON task_events(run_id, id)"
