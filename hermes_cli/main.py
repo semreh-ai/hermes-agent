@@ -873,6 +873,11 @@ to avoid false-positive reinstalls on every launch.
 def _tui_need_npm_install(root: Path) -> bool:
     """True when @hermes/ink is missing or node_modules is behind package-lock.json.
 
+    Prebuilt bundle mode: when ``dist/entry.js`` exists and there is no
+    ``package-lock.json`` (nix install layout only ships ``dist/`` +
+    ``package.json``), skip reinstall entirely — the bundle is self-contained
+    and there is nothing to install.
+
     Compares ``package-lock.json`` against ``node_modules/.package-lock.json``
     (npm's hidden lockfile) by **content**, not mtime: git checkouts and npm
     rewrites can bump the root lockfile's timestamp even when installed deps
@@ -890,10 +895,16 @@ def _tui_need_npm_install(root: Path) -> bool:
     we'd rather not force a reinstall for them. Falls back to mtime
     comparison if either lockfile is unparseable.
     """
+    lock = root / "package-lock.json"
+    entry = root / "dist" / "entry.js"
+    # Prebuilt self-contained bundle (nix / packaged release): no lockfile
+    # shipped, dist/entry.js is the single runtime artefact.
+    if entry.is_file() and not lock.is_file():
+        return False
+
     ink = root / "node_modules" / "@hermes" / "ink" / "package.json"
     if not ink.is_file():
         return True
-    lock = root / "package-lock.json"
     if not lock.is_file():
         return False
     marker = root / "node_modules" / ".package-lock.json"
@@ -929,63 +940,6 @@ def _tui_need_npm_install(root: Path) -> bool:
         ):
             return True
 
-    return False
-
-
-def _find_bundled_tui(tui_dir: Path) -> Optional[Path]:
-    """Directory whose dist/entry.js we should run: HERMES_TUI_DIR first, else repo ui-tui."""
-    env = os.environ.get("HERMES_TUI_DIR")
-    if env:
-        p = Path(env)
-        if (p / "dist" / "entry.js").exists() and not _tui_need_npm_install(p):
-            return p
-    if (tui_dir / "dist" / "entry.js").exists() and not _tui_need_npm_install(tui_dir):
-        return tui_dir
-    return None
-
-
-def _tui_build_needed(tui_dir: Path) -> bool:
-    if _hermes_ink_bundle_stale(tui_dir):
-        return True
-    entry = tui_dir / "dist" / "entry.js"
-    if not entry.exists():
-        return True
-    dist_m = entry.stat().st_mtime
-    skip = frozenset({"node_modules", "dist"})
-    for dirpath, dirnames, filenames in os.walk(tui_dir, topdown=True):
-        dirnames[:] = [d for d in dirnames if d not in skip]
-        for fn in filenames:
-            if fn.endswith((".ts", ".tsx")):
-                if os.path.getmtime(os.path.join(dirpath, fn)) > dist_m:
-                    return True
-    for meta in (
-        "package.json",
-        "package-lock.json",
-        "tsconfig.json",
-        "tsconfig.build.json",
-    ):
-        mp = tui_dir / meta
-        if mp.exists() and mp.stat().st_mtime > dist_m:
-            return True
-    return False
-
-
-def _hermes_ink_bundle_stale(tui_dir: Path) -> bool:
-    ink_root = tui_dir / "packages" / "hermes-ink"
-    bundle = ink_root / "dist" / "ink-bundle.js"
-    if not bundle.exists():
-        return True
-    bm = bundle.stat().st_mtime
-    skip = frozenset({"node_modules", "dist"})
-    for dirpath, dirnames, filenames in os.walk(ink_root, topdown=True):
-        dirnames[:] = [d for d in dirnames if d not in skip]
-        for fn in filenames:
-            if fn.endswith((".ts", ".tsx")):
-                if os.path.getmtime(os.path.join(dirpath, fn)) > bm:
-                    return True
-    mp = ink_root / "package.json"
-    if mp.exists() and mp.stat().st_mtime > bm:
-        return True
     return False
 
 
@@ -1047,7 +1001,7 @@ def _ensure_tui_node() -> None:
 
 
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
-    """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR or ui-tui, build when stale)."""
+    """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
 
     def _node_bin(bin: str) -> str:
@@ -1061,23 +1015,31 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             sys.exit(1)
         return path
 
-    # pre-built dist + node_modules (nix / full HERMES_TUI_DIR) skips npm.
+    # Footgun: --dev against a prebuilt bundle that has no source/node_modules.
+    ext_dir = os.environ.get("HERMES_TUI_DIR")
+    if tui_dev and ext_dir:
+        print(
+            f"Error: --dev is incompatible with HERMES_TUI_DIR={ext_dir}\n"
+            f"The prebuilt TUI has no source code to hot-reload.\n"
+            f"Unset HERMES_TUI_DIR (e.g. `unset HERMES_TUI_DIR`) to use --dev from a checkout.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 1. Prebuilt bundle (nix / packaged release): just run it.
     if not tui_dev:
-        ext_dir = os.environ.get("HERMES_TUI_DIR")
         if ext_dir:
             p = Path(ext_dir)
-            if (p / "dist" / "entry.js").exists() and not _tui_need_npm_install(p):
+            if (p / "dist" / "entry.js").is_file():
                 node = _node_bin("node")
                 return [node, str(p / "dist" / "entry.js")], p
 
-    npm = _node_bin("npm")
+    # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
+    #    --dev flow: npm install if needed, then tsx src/entry.tsx (no build).
     if _tui_need_npm_install(tui_dir):
+        npm = _node_bin("npm")
         if not os.environ.get("HERMES_QUIET"):
             print("Installing TUI dependencies…")
-        # Capture stdout as well as stderr — some npm errors (notably EACCES on a
-        # root-owned node_modules in containers) are emitted on stdout, and a
-        # bare "npm install failed." with no preview defeats debugging.  We keep
-        # the failure-only print path so a successful install stays silent.
         result = subprocess.run(
             [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
             cwd=str(tui_dir),
@@ -1095,47 +1057,30 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             sys.exit(1)
 
     if tui_dev:
-        if _hermes_ink_bundle_stale(tui_dir):
-            result = subprocess.run(
-                [npm, "run", "build", "--prefix", "packages/hermes-ink"],
-                cwd=str(tui_dir),
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
-                preview = "\n".join(combined.splitlines()[-30:])
-                print("@hermes/ink build failed.")
-                if preview:
-                    print(preview)
-                sys.exit(1)
         tsx = tui_dir / "node_modules" / ".bin" / "tsx"
         if tsx.exists():
             return [str(tsx), "src/entry.tsx"], tui_dir
+        npm = _node_bin("npm")
         return [npm, "start"], tui_dir
 
-    if _tui_build_needed(tui_dir):
-        result = subprocess.run(
-            [npm, "run", "build"],
-            cwd=str(tui_dir),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
-            preview = "\n".join(combined.splitlines()[-30:])
-            print("TUI build failed.")
-            if preview:
-                print(preview)
-            sys.exit(1)
-
-    root = _find_bundled_tui(tui_dir)
-    if not root:
-        print("TUI build did not produce dist/entry.js")
+    # Always rebuild — esbuild is fast and this avoids staleness-edge-case bugs.
+    npm = _node_bin("npm")
+    result = subprocess.run(
+        [npm, "run", "build"],
+        cwd=str(tui_dir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
+        preview = "\n".join(combined.splitlines()[-30:])
+        print("TUI build failed.")
+        if preview:
+            print(preview)
         sys.exit(1)
 
     node = _node_bin("node")
-    return [node, str(root / "dist" / "entry.js")], root
+    return [node, str(tui_dir / "dist" / "entry.js")], tui_dir
 
 
 def _normalize_tui_toolsets(toolsets: object) -> list[str]:
@@ -2445,30 +2390,31 @@ def _prompt_provider_choice(choices, *, default=0):
 def _model_flow_openrouter(config, current_model=""):
     """OpenRouter provider: ensure API key, then pick model."""
     from hermes_cli.auth import (
+        ProviderConfig,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("OPENROUTER_API_KEY")
-    if not api_key:
-        print("No OpenRouter API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand. The
+    # previous bypass-when-key-exists branch left no way to recover from a
+    # bad paste short of re-running `hermes setup` from scratch. OpenRouter
+    # isn't in PROVIDER_REGISTRY so we synthesize a minimal pconfig.
+    pconfig = ProviderConfig(
+        id="openrouter",
+        name="OpenRouter",
+        auth_type="api_key",
+        api_key_env_vars=("OPENROUTER_API_KEY",),
+    )
+    existing_key = get_env_value("OPENROUTER_API_KEY") or ""
+    if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("OpenRouter API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("OPENROUTER_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="openrouter")
+    if abort:
+        return
 
     from hermes_cli.models import model_ids, get_pricing_for_provider
 
@@ -2504,33 +2450,26 @@ def _model_flow_openrouter(config, current_model=""):
 def _model_flow_ai_gateway(config, current_model=""):
     """Vercel AI Gateway provider: ensure API key, then pick model with pricing."""
     from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
     )
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value
 
-    api_key = get_env_value("AI_GATEWAY_API_KEY")
-    if not api_key:
-        print("No Vercel AI Gateway API key configured.")
+    # Route through _prompt_api_key so users can replace a stale/broken key
+    # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand.
+    pconfig = PROVIDER_REGISTRY["ai-gateway"]
+    existing_key = get_env_value("AI_GATEWAY_API_KEY") or ""
+    if not existing_key:
         print(
             "Create API key here: https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway&title=AI+Gateway"
         )
         print("Add a payment method to get $5 in free credits.")
         print()
-        try:
-            import getpass
-
-            key = getpass.getpass("AI Gateway API key (or Enter to cancel): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print()
-            return
-        if not key:
-            print("Cancelled.")
-            return
-        save_env_value("AI_GATEWAY_API_KEY", key)
-        print("API key saved.")
-        print()
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="ai-gateway")
+    if abort:
+        return
 
     from hermes_cli.models import ai_gateway_model_ids, get_pricing_for_provider
 
@@ -2620,6 +2559,8 @@ def _model_flow_nous(config, current_model="", args=None):
         get_pricing_for_provider,
         check_nous_free_tier,
         partition_nous_models_by_tier,
+        union_with_portal_free_recommendations,
+        union_with_portal_paid_recommendations,
     )
 
     model_ids = get_curated_nous_model_ids()
@@ -2660,19 +2601,8 @@ def _model_flow_nous(config, current_model="", args=None):
     # Check if user is on free tier
     free_tier = check_nous_free_tier()
 
-    # For free users: partition models into selectable/unavailable based on
-    # whether they are free per the Portal-reported pricing.
-    unavailable_models: list[str] = []
-    if free_tier:
-        model_ids, unavailable_models = partition_nous_models_by_tier(
-            model_ids, pricing, free_tier=True
-        )
-
-    if not model_ids and not unavailable_models:
-        print("No models available for Nous Portal after filtering.")
-        return
-
-    # Resolve portal URL for upgrade links (may differ on staging)
+    # Resolve portal URL early — needed both for upgrade links and for the
+    # freeRecommendedModels endpoint below.
     _nous_portal_url = ""
     try:
         _nous_state = get_provider_auth_state("nous")
@@ -2680,6 +2610,32 @@ def _model_flow_nous(config, current_model="", args=None):
             _nous_portal_url = _nous_state.get("portal_base_url", "")
     except Exception:
         pass
+
+    # For free users: partition models into selectable/unavailable based on
+    # whether they are free per the Portal-reported pricing.  First augment
+    # with the Portal's freeRecommendedModels list so newly-launched free
+    # models show up even if this CLI build's hardcoded curated list and
+    # docs-hosted manifest haven't caught up yet.
+    #
+    # For paid users: mirror the same idea with paidRecommendedModels so
+    # newly-launched paid models surface in the picker too — independent
+    # of CLI release cadence.
+    unavailable_models: list[str] = []
+    if free_tier:
+        model_ids, pricing = union_with_portal_free_recommendations(
+            model_ids, pricing, _nous_portal_url,
+        )
+        model_ids, unavailable_models = partition_nous_models_by_tier(
+            model_ids, pricing, free_tier=True
+        )
+    else:
+        model_ids, pricing = union_with_portal_paid_recommendations(
+            model_ids, pricing, _nous_portal_url,
+        )
+
+    if not model_ids and not unavailable_models:
+        print("No models available for Nous Portal after filtering.")
+        return
 
     if free_tier and not model_ids:
         print("No free models currently available.")
@@ -3093,6 +3049,21 @@ def _model_flow_custom(config):
             else:
                 print(f"  If /v1 should not be in the base URL, try: {suggested}")
 
+    # Prompt for API compatibility mode explicitly so codex-compatible custom
+    # providers don't silently fall back to chat_completions.
+    current_model_cfg = config.get("model")
+    current_api_mode = ""
+    if isinstance(current_model_cfg, dict):
+        current_api_mode = str(current_model_cfg.get("api_mode") or "").strip()
+    api_mode = _prompt_custom_api_mode_selection(
+        effective_url,
+        current_api_mode=current_api_mode,
+    )
+    if api_mode:
+        print(f"  API mode: {api_mode}")
+    else:
+        print("  API mode: auto-detect")
+
     # Select model — use probe results when available, fall back to manual input
     model_name = ""
     detected_models = probe.get("models") or []
@@ -3156,7 +3127,10 @@ def _model_flow_custom(config):
         model["base_url"] = effective_url
         if effective_key:
             model["api_key"] = effective_key
-        model.pop("api_mode", None)  # let runtime auto-detect from URL
+        if api_mode:
+            model["api_mode"] = api_mode
+        else:
+            model.pop("api_mode", None)
         save_config(cfg)
         deactivate_provider()
 
@@ -3179,7 +3153,10 @@ def _model_flow_custom(config):
         _caller_model["base_url"] = effective_url
         if effective_key:
             _caller_model["api_key"] = effective_key
-        _caller_model.pop("api_mode", None)
+        if api_mode:
+            _caller_model["api_mode"] = api_mode
+        else:
+            _caller_model.pop("api_mode", None)
         config["model"] = _caller_model
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
@@ -3190,7 +3167,78 @@ def _model_flow_custom(config):
         model_name or "",
         context_length=context_length,
         name=display_name,
+        api_mode=api_mode,
     )
+
+
+def _prompt_custom_api_mode_selection(base_url: str, current_api_mode: str = "") -> Optional[str]:
+    """Prompt for a custom provider API mode.
+
+    Returns an explicit mode string, or None to keep auto-detect behavior.
+    """
+    from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+    detected_mode = _detect_api_mode_for_url(base_url)
+    normalized_current = str(current_api_mode or "").strip().lower()
+    default_mode = normalized_current or detected_mode or ""
+
+    mode_options = [
+        (
+            "",
+            "Auto-detect",
+            "Use Hermes URL heuristics; best for standard OpenAI-compatible endpoints.",
+        ),
+        (
+            "chat_completions",
+            "Chat Completions",
+            "Use /chat/completions for standard OpenAI-compatible servers.",
+        ),
+        (
+            "codex_responses",
+            "Responses / Codex",
+            "Use /responses for Codex-compatible tool-calling backends.",
+        ),
+        (
+            "anthropic_messages",
+            "Anthropic Messages",
+            "Use /v1/messages for Anthropic-compatible endpoints.",
+        ),
+    ]
+
+    print()
+    print("Select API compatibility mode:")
+    for idx, (value, label, description) in enumerate(mode_options, 1):
+        markers = []
+        if value == detected_mode:
+            markers.append("detected")
+        if value == default_mode:
+            markers.append("current")
+        suffix = f" [{' / '.join(markers)}]" if markers else ""
+        print(f"  {idx}. {label}{suffix}")
+        print(f"     {description}")
+
+    try:
+        raw = input(
+            "Choice [1-4, Enter to keep current/detected]: "
+        ).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        raise
+
+    if not raw:
+        return default_mode or None
+
+    if raw in {"1", "auto", "detect", "auto-detect"}:
+        return None
+    if raw in {"2", "chat", "chat_completions", "completions"}:
+        return "chat_completions"
+    if raw in {"3", "responses", "codex", "codex_responses"}:
+        return "codex_responses"
+    if raw in {"4", "anthropic", "anthropic_messages", "messages"}:
+        return "anthropic_messages"
+
+    print(f"Invalid API mode choice: {raw}. Falling back to auto-detect.")
+    return None
 
 
 def _auto_provider_name(base_url: str) -> str:
@@ -3228,12 +3276,12 @@ def _custom_provider_api_key_config_value(provider_info, resolved_api_key=""):
 
 
 def _save_custom_provider(
-    base_url, api_key="", model="", context_length=None, name=None
+    base_url, api_key="", model="", context_length=None, name=None, api_mode=None
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
     Deduplicates by base_url — if the URL already exists, updates the
-    model name and context_length but doesn't add a duplicate entry.
+    model name, context_length, and api_mode but doesn't add a duplicate entry.
     Uses *name* when provided, otherwise auto-generates from the URL.
     """
     from hermes_cli.config import load_config, save_config
@@ -3259,6 +3307,13 @@ def _save_custom_provider(
                 models_cfg[model] = {"context_length": context_length}
                 entry["models"] = models_cfg
                 changed = True
+            if api_mode:
+                if entry.get("api_mode") != api_mode:
+                    entry["api_mode"] = api_mode
+                    changed = True
+            elif "api_mode" in entry:
+                entry.pop("api_mode", None)
+                changed = True
             if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
@@ -3273,6 +3328,8 @@ def _save_custom_provider(
         entry["api_key"] = api_key
     if model:
         entry["model"] = model
+    if api_mode:
+        entry["api_mode"] = api_mode
     if model and context_length:
         entry["models"] = {model: {"context_length": context_length}}
 
@@ -3726,7 +3783,7 @@ def _model_flow_named_custom(config, provider_info):
                 save_config(cfg)
     else:
         # Save model name to the custom_providers entry for next time
-        _save_custom_provider(base_url, config_api_key, model_name)
+        _save_custom_provider(base_url, config_api_key, model_name, api_mode=api_mode)
 
     print(f"\n✅ Model set to: {model_name}")
     print(f"   Provider: {name} ({base_url})")
@@ -4883,6 +4940,37 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         )
         if model_list:
             print(f"  Found {len(model_list)} model(s) from Ollama Cloud")
+    elif provider_id == "novita":
+        from hermes_cli.models import fetch_api_models
+
+        api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
+        curated = _PROVIDER_MODELS.get(provider_id, [])
+        live_models = fetch_api_models(api_key_for_probe, effective_base)
+        if live_models:
+            model_list = live_models
+            print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
+        else:
+            mdev_models: list = []
+            try:
+                from agent.models_dev import list_agentic_models
+
+                mdev_models = list_agentic_models(provider_id)
+            except Exception:
+                pass
+            if mdev_models:
+                seen = {m.lower() for m in mdev_models}
+                model_list = list(mdev_models)
+                for m in curated:
+                    if m.lower() not in seen:
+                        model_list.append(m)
+                        seen.add(m.lower())
+                print(f"  Found {len(model_list)} model(s) from models.dev registry")
+            else:
+                model_list = curated
+                if model_list:
+                    print(
+                        f'  Showing {len(model_list)} curated models — use "Enter custom model name" for others.'
+                    )
     else:
         curated = _PROVIDER_MODELS.get(provider_id, [])
 
@@ -5460,7 +5548,6 @@ def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0)
 def _web_ui_build_needed(web_dir: Path) -> bool:
     """Return True if the web UI dist is missing or stale.
 
-    Mirrors the staleness logic used by ``_tui_build_needed()`` for the TUI.
     The Vite build outputs to ``hermes_cli/web_dist/`` (per vite.config.ts
     outDir: "../hermes_cli/web_dist"), NOT to ``web/dist/``.  Uses the Vite
     manifest as the sentinel because it is written last and therefore has the
@@ -6576,6 +6663,74 @@ def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
                 pass  # still locked or in use — try again next run
     except OSError:
         pass
+
+
+def _refresh_active_lazy_features() -> None:
+    """Refresh lazy-installed backends after a code update.
+
+    When pyproject.toml's ``[all]`` extra was slimmed down (May 2026), most
+    optional backends moved to ``tools/lazy_deps.py`` and only install on
+    first use. ``hermes update`` runs ``uv pip install -e .[all]`` which
+    leaves those packages untouched — so if we bump a pin in
+    :data:`LAZY_DEPS` (CVE response, transitive bug fix), users who already
+    activated the backend keep the stale version forever.
+
+    This function asks lazy_deps which features the user has previously
+    activated and reinstalls them under the current pins. Features the
+    user never enabled stay quiet — no churn for cold backends.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from tools import lazy_deps
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (import failed): %s", exc)
+        return
+
+    try:
+        active = lazy_deps.active_features()
+    except Exception as exc:
+        logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
+        return
+
+    if not active:
+        return
+
+    print()
+    print(f"→ Refreshing {len(active)} active lazy backend(s)...")
+
+    try:
+        results = lazy_deps.refresh_active_features(prompt=False)
+    except Exception as exc:
+        # refresh_active_features is documented as never-raise, but defend
+        # the update flow against future regressions.
+        print(f"  ⚠ Lazy refresh failed unexpectedly: {exc}")
+        return
+
+    refreshed = [f for f, s in results.items() if s == "refreshed"]
+    current = [f for f, s in results.items() if s == "current"]
+    failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
+    skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
+
+    if refreshed:
+        print(f"  ↑ {len(refreshed)} refreshed: {', '.join(refreshed)}")
+    if current:
+        print(f"  ✓ {len(current)} already current")
+    if skipped:
+        # Most common reason: security.allow_lazy_installs=false. Show one
+        # line so the user knows why; not an error.
+        names = ", ".join(f for f, _ in skipped)
+        reason = skipped[0][1].split(": ", 1)[-1]
+        print(f"  · {len(skipped)} skipped ({reason}): {names}")
+    if failed:
+        for feature, status in failed:
+            reason = status.split(": ", 1)[-1]
+            # Clip noisy pip stderr to keep update output legible.
+            if len(reason) > 200:
+                reason = reason[:200] + "..."
+            print(f"  ⚠ {feature} failed to refresh: {reason}")
+        print("  Backends keep their previously-installed version; rerun")
+        print("  `hermes update` once the upstream issue is resolved.")
 
 
 def _install_python_dependencies_with_optional_fallback(
@@ -9068,12 +9223,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         input_fn=gw_input_fn,
                     )
 
+
         _run_post_update_steps(
             git_cmd=git_cmd, cwd=PROJECT_ROOT, args=args,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn,
             auto_stash_ref=auto_stash_ref, prompt_for_restore=prompt_for_restore,
             current_branch=current_branch, is_fork=is_fork, branch=branch,
         )
+
 
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
@@ -9603,9 +9760,119 @@ def _build_provider_choices() -> list[str]:
             "auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot",
             "anthropic", "gemini", "google-gemini-cli", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
-            "stepfun", "minimax", "minimax-cn", "kilocode", "xiaomi", "arcee",
+            "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
         ]
+
+
+
+# Top-level subcommands that argparse knows about WITHOUT running plugin
+# discovery.  Used to short-circuit eager plugin imports (which can take
+# 500ms+ pulling in google.cloud.pubsub_v1, aiohttp, grpc, etc.) when the
+# user's invocation clearly doesn't need any plugin-registered subcommand.
+#
+# Keep this in sync with the ``subparsers.add_parser("NAME", ...)`` calls
+# below in ``main()``. Missing an entry here only costs a one-time
+# discovery; extra entries here would let a plugin command silently fail
+# to parse.
+_BUILTIN_SUBCOMMANDS = frozenset(
+    {
+        "acp", "auth", "backup", "checkpoints", "claw", "completion",
+        "computer-use",
+        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
+        "model", "pairing", "plugins", "profile", "sessions", "setup",
+        "skills", "slack", "status", "tools", "uninstall", "update",
+        "version", "webhook", "whatsapp", "chat",
+        # Help-ish invocations — plugin commands not being listed in
+        # top-level --help is an acceptable trade-off for skipping an
+        # expensive eager import of every bundled plugin module.
+        "help",
+    }
+)
+
+
+# Top-level flags that take a value. Needed by ``_first_positional_argv``
+# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
+# flag value rather than misclassified as a subcommand. Kept in sync with
+# the top-level flags declared in ``hermes_cli/_parser.py``.
+#
+# Correctness-safe either way: missing an entry here only makes the
+# fast-path bail out too eagerly (we run plugin discovery when we didn't
+# need to); extra entries would make us skip a real positional.
+_TOP_LEVEL_VALUE_FLAGS = frozenset(
+    {
+        "-z", "--oneshot",
+        "-m", "--model",
+        "--provider",
+        "-t", "--toolsets",
+        "-r", "--resume",
+        "-s", "--skills",
+        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
+        # value-taking: if the next token is a subcommand-looking word
+        # the user almost certainly meant it as the session name, and
+        # either interpretation keeps us on the safe side.
+        "-c", "--continue",
+    }
+)
+
+
+def _first_positional_argv() -> str | None:
+    """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
+
+    Used by ``main()`` to decide whether plugin discovery has to run at
+    argparse-setup time. Handles common invocations like
+    ``hermes -m gpt5 --provider openai chat "msg"`` by skipping the
+    values attached to known top-level flags.
+
+    Does NOT fully simulate argparse — unknown ``--foo=bar`` / ``--foo
+    bar`` flags degrade gracefully (``bar`` may be wrongly classified as
+    a positional, which at worst forces a one-time plugin discovery).
+    """
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            # Everything after ``--`` is positional.
+            if i + 1 < len(argv):
+                return argv[i + 1]
+            return None
+        if tok.startswith("-"):
+            # ``--flag=value`` carries its value inline — single token.
+            if "=" in tok:
+                i += 1
+                continue
+            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
+                i += 2
+                continue
+            i += 1
+            continue
+        return tok
+    return None
+
+
+def _plugin_cli_discovery_needed() -> bool:
+    """True when the CLI might be invoking a plugin-registered subcommand.
+
+    Returning False lets ``main()`` skip plugin discovery entirely during
+    argparse setup, saving ~500-650ms per invocation for users whose
+    enabled plugins don't contribute any CLI command.
+    """
+    first = _first_positional_argv()
+    if first is None:
+        # Bare ``hermes`` or only flags → defaults to ``chat``.
+        return False
+    if first in _BUILTIN_SUBCOMMANDS:
+        return False
+    # Unknown token — could be a plugin subcommand, OR a chat prompt
+    # starting with a non-flag word. Either way we need discovery: if it
+    # IS a plugin command, argparse needs the subparser; if it's a chat
+    # prompt, argparse will route it via positional handling and the
+    # extra discovery cost is amortized over a full agent run anyway.
+    return True
+
 
 
 def main():
@@ -9702,7 +9969,7 @@ def main():
     gateway_parser = subparsers.add_parser(
         "gateway",
         help="Messaging gateway management",
-        description="Manage the messaging gateway (Telegram, Discord, WhatsApp)",
+        description="Manage the messaging gateway (Telegram, Discord, WhatsApp, Weixin, and more)",
     )
     gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command")
 
@@ -9844,6 +10111,17 @@ def main():
     )
 
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # lsp command
+    # =========================================================================
+    try:
+        from agent.lsp.cli import register_subparser as _lsp_register
+        _lsp_register(subparsers)
+    except Exception as _lsp_err:  # noqa: BLE001
+        # LSP is optional infrastructure — never let a registration
+        # failure break the CLI overall.
+        logger.debug("LSP CLI registration failed: %s", _lsp_err)
 
     # =========================================================================
     # setup command
@@ -10406,6 +10684,16 @@ def main():
     )
     doctor_parser.add_argument(
         "--fix", action="store_true", help="Attempt to fix issues automatically"
+    )
+    doctor_parser.add_argument(
+        "--ack",
+        metavar="ADVISORY_ID",
+        default=None,
+        help=(
+            "Acknowledge a security advisory by ID and exit. After ack, the "
+            "advisory will no longer trigger startup banners. Run `hermes "
+            "doctor` first to see active advisories and their IDs."
+        ),
     )
     doctor_parser.set_defaults(func=cmd_doctor)
 
@@ -11100,6 +11388,78 @@ Examples:
             tools_command(args)
 
     tools_parser.set_defaults(func=cmd_tools)
+
+
+    # =========================================================================
+    # computer-use command — manage Computer Use (cua-driver) on macOS
+    # =========================================================================
+    computer_use_parser = subparsers.add_parser(
+        "computer-use",
+        help="Manage the Computer Use (cua-driver) backend (macOS)",
+        description=(
+            "Install or check the cua-driver binary used by the\n"
+            "`computer_use` toolset. macOS-only.\n\n"
+            "Use `hermes computer-use install` to fetch and run the\n"
+            "upstream cua-driver installer. This is equivalent to the\n"
+            "post-setup hook that `hermes tools` runs when you first\n"
+            "enable the Computer Use toolset, and is a stable target\n"
+            "for re-running the install if it didn't fire (e.g. when\n"
+            "toggling the toolset on a returning-user setup)."
+        ),
+    )
+    computer_use_sub = computer_use_parser.add_subparsers(dest="computer_use_action")
+
+    computer_use_install = computer_use_sub.add_parser(
+        "install",
+        help="Install or repair the cua-driver binary (macOS)",
+    )
+    computer_use_install.add_argument(
+        "--upgrade",
+        action="store_true",
+        help=(
+            "Re-run the upstream installer even if cua-driver is already on "
+            "PATH. The upstream install.sh always pulls the latest release, "
+            "so this performs an in-place upgrade."
+        ),
+    )
+    computer_use_sub.add_parser(
+        "status",
+        help="Print whether cua-driver is installed and on PATH",
+    )
+
+    def cmd_computer_use(args):
+        action = getattr(args, "computer_use_action", None)
+        if action == "install":
+            from hermes_cli.tools_config import install_cua_driver
+            install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
+            return
+        if action == "status":
+            import shutil
+            import subprocess
+            path = shutil.which("cua-driver")
+            if path:
+                version = ""
+                try:
+                    version = subprocess.run(
+                        ["cua-driver", "--version"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                except Exception:
+                    pass
+                if version:
+                    print(f"cua-driver: installed at {path} ({version})")
+                else:
+                    print(f"cua-driver: installed at {path}")
+                print("  Refresh to latest: hermes computer-use install --upgrade")
+                return
+            print("cua-driver: not installed")
+            print("  Run: hermes computer-use install")
+            return
+        # No subcommand → show help
+        computer_use_parser.print_help()
+
+    computer_use_parser.set_defaults(func=cmd_computer_use)
+
     # =========================================================================
     # mcp command — manage MCP server connections
     # =========================================================================
