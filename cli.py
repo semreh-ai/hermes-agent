@@ -11585,14 +11585,9 @@ class HermesCLI:
         _bind_prompt_submit_keys(kb, handle_enter)
         
         @kb.add('escape', 'enter')
-        def handle_alt_enter(event):
-            """Alt+Enter inserts a newline for multi-line input.
-
-            Works on mac/Linux/WSL. On Windows Terminal this keystroke is
-            intercepted at the terminal layer (toggles fullscreen) and never
-            reaches here — Windows users get newline via Ctrl+Enter instead
-            (bound below as c-j, since WT delivers Ctrl+Enter as LF).
-            """
+        @kb.add('c-o')
+        def handle_insert_newline(event):
+            """Alt+Enter/Esc Enter or Ctrl+O inserts a newline for multi-line input."""
             event.current_buffer.insert_text('\n')
 
         if _preserve_ctrl_enter_newline():
