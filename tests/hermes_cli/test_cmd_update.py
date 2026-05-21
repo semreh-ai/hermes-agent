@@ -276,6 +276,45 @@ class TestCmdUpdateProfileSkillSync:
         assert default_p.path in synced_paths
 
 
+def test_update_verification_preinstalls_staged_pytest_timeout(tmp_path, capsys):
+    from hermes_cli import main as hm
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "hermes-agent"
+version = "0.0.0"
+
+[project.optional-dependencies]
+dev = ["pytest==9.0.2", "pytest-timeout==2.4.0"]
+
+[tool.pytest.ini_options]
+addopts = "--timeout=30 --timeout-method=signal"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with patch("importlib.util.find_spec", return_value=None), patch(
+        "shutil.which", return_value="/usr/bin/uv"
+    ), patch("subprocess.run", side_effect=fake_run):
+        hm._ensure_update_verification_pytest_plugins(
+            tmp_path,
+            ["python -m pytest -q tests/hermes_cli/test_cmd_update.py"],
+        )
+
+    assert len(calls) == 1
+    assert calls[0][0][:4] == ["/usr/bin/uv", "pip", "install", "--python"]
+    assert calls[0][0][4] == hm.sys.executable
+    assert calls[0][0][-1] == "pytest-timeout==2.4.0"
+    assert "Preparing pytest verifier dependency" in capsys.readouterr().out
+
+
 def test_is_termux_env_true_for_termux_prefix():
     from hermes_cli import main as hm
 

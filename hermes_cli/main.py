@@ -8345,6 +8345,131 @@ def _collect_unmerged_files(git_cmd: list[str], cwd: Path) -> list[str]:
     return [part for part in result.stdout.split("\0") if part]
 
 
+def _load_update_pyproject(staging_cwd: Path) -> dict:
+    """Load pyproject.toml from a staged update worktree, best-effort."""
+    pyproject = staging_cwd / "pyproject.toml"
+    if not pyproject.exists():
+        return {}
+    try:
+        import tomllib
+
+        return tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Could not parse staged pyproject.toml: %s", exc)
+        return {}
+
+
+def _staged_optional_dependency_spec(
+    staging_cwd: Path, extra: str, package_name: str
+) -> str | None:
+    """Return the staged extra's requirement string for ``package_name``.
+
+    Update verification runs before post-update dependency sync.  When upstream
+    adds a pytest plugin and immediately enables its CLI args in pyproject
+    addopts, the old venv sees "unrecognized arguments" and blocks an otherwise
+    valid staged merge.  Installing the exact staged dev requirement keeps the
+    verifier aligned without editable-installing the staging tree.
+    """
+    data = _load_update_pyproject(staging_cwd)
+    deps = (
+        data.get("project", {})
+        .get("optional-dependencies", {})
+        .get(extra, [])
+    )
+    if not isinstance(deps, list):
+        return None
+
+    import re
+
+    want = package_name.lower().replace("_", "-")
+    for dep in deps:
+        dep_s = str(dep).strip()
+        name = re.split(r"[<>=!~;\[\s]", dep_s, maxsplit=1)[0]
+        if name.lower().replace("_", "-") == want:
+            return dep_s
+    return None
+
+
+def _install_update_verification_dependency(requirement: str) -> bool:
+    """Install a verifier-only dependency into the active Hermes venv."""
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [uv_bin, "pip", "install", "--python", sys.executable, requirement]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", requirement]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except Exception as exc:
+        print(f"  ⚠ Could not install verifier dependency {requirement}: {exc}")
+        return False
+
+    if result.returncode == 0:
+        return True
+
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    tail = output.splitlines()[-1] if output else "unknown error"
+    print(f"  ⚠ Could not install verifier dependency {requirement}: {tail[:200]}")
+    return False
+
+
+def _ensure_update_verification_pytest_plugins(
+    staging_cwd: Path, commands: list[str]
+) -> None:
+    """Preinstall staged pytest plugins required by pyproject addopts.
+
+    This is intentionally narrow: it does not editable-install the staging
+    checkout before promotion.  It only fills missing pytest plugin packages
+    that pyproject addopts make mandatory for verification to even parse.
+    """
+    import importlib.util
+    import shlex
+
+    has_pytest_command = False
+    for command in commands:
+        try:
+            argv = shlex.split(command) if isinstance(command, str) else list(command)
+        except ValueError:
+            continue
+        if any(part == "pytest" or str(part).endswith("pytest") for part in argv):
+            has_pytest_command = True
+            break
+    if not has_pytest_command:
+        return
+
+    data = _load_update_pyproject(staging_cwd)
+    addopts = (
+        data.get("tool", {})
+        .get("pytest", {})
+        .get("ini_options", {})
+        .get("addopts", "")
+    )
+    if isinstance(addopts, list):
+        addopts_text = " ".join(str(item) for item in addopts)
+    else:
+        addopts_text = str(addopts or "")
+
+    # pytest-timeout registers --timeout / --timeout-method.  Missing it was
+    # the May 2026 fork-update blocker: conflicts were resolved correctly, but
+    # staged verification failed before post-update dependency sync could run.
+    needs_timeout = "--timeout" in addopts_text or any(
+        "--timeout" in str(command) for command in commands
+    )
+    if needs_timeout and importlib.util.find_spec("pytest_timeout") is None:
+        requirement = (
+            _staged_optional_dependency_spec(staging_cwd, "dev", "pytest-timeout")
+            or "pytest-timeout"
+        )
+        print(f"  → Preparing pytest verifier dependency: {requirement}")
+        _install_update_verification_dependency(requirement)
+
+
 def _build_update_resolver_prompt(
     *,
     live_cwd: Path,
@@ -8540,6 +8665,7 @@ def _run_update_verification(
 
     commands = resolver_cfg.get("verify_commands") or []
     verify_timeout = int(resolver_cfg.get("verify_timeout_seconds", 300))
+    _ensure_update_verification_pytest_plugins(staging_cwd, commands)
     for command in commands:
         try:
             argv = shlex.split(command) if isinstance(command, str) else list(command)
