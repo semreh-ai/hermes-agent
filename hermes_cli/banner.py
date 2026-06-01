@@ -12,14 +12,16 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-
-from prompt_toolkit import print_formatted_text as _pt_print
-from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+# rich and prompt_toolkit are imported lazily (inside the functions that use
+# them) rather than at module level.  Importing this module is on the TUI
+# gateway's critical startup path purely to reach the lightweight update-check
+# helpers (``prefetch_update_check``); pulling rich.console + prompt_toolkit
+# eagerly added ~50ms of wasted imports before ``gateway.ready`` could fire.
+# Keep the type-only reference available to checkers without the runtime cost.
+if TYPE_CHECKING:
+    from rich.console import Console
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,8 @@ _RST = "\033[0m"
 
 def cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's renderer."""
+    from prompt_toolkit import print_formatted_text as _pt_print
+    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
     _pt_print(_PT_ANSI(text))
 
 
@@ -274,6 +278,11 @@ def check_for_updates() -> Optional[int]:
             return None
         target_ref = _resolve_update_ref(repo_dir)
 
+    # Read cache — invalidate if the embedded rev OR installed version has
+    # changed since the last check. The version guard matters for pip installs:
+    # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
+    # changes VERSION but leaves rev unchanged (both None), and without this
+    # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
     now = time.time()
     try:
         if cache_file.exists():
@@ -284,6 +293,7 @@ def check_for_updates() -> Optional[int]:
                 and cached.get("repo") == (str(repo_dir) if repo_dir else None)
                 and cached.get("target_ref") == target_ref
                 and cached.get("branch") == current_branch
+                and cached.get("ver") == VERSION
             ):
                 return cached.get("behind")
     except Exception:
@@ -295,14 +305,17 @@ def check_for_updates() -> Optional[int]:
         behind = _check_via_local_git(repo_dir, target_ref)
 
     try:
-        cache_file.write_text(json.dumps({
-            "ts": now,
-            "behind": behind,
-            "rev": embedded_rev,
-            "repo": str(repo_dir) if repo_dir else None,
-            "target_ref": target_ref,
-            "branch": current_branch,
-        }))
+        cache_file.write_text(
+            json.dumps({
+                "ts": now,
+                "behind": behind,
+                "rev": embedded_rev,
+                "ver": VERSION,
+                "repo": str(repo_dir) if repo_dir else None,
+                "target_ref": target_ref,
+                "branch": current_branch,
+            })
+        )
     except Exception:
         pass
 
@@ -535,7 +548,7 @@ def _display_toolset_name(toolset_name: str) -> str:
     )
 
 
-def build_welcome_banner(console: Console, model: str, cwd: str,
+def build_welcome_banner(console: "Console", model: str, cwd: str,
                          tools: List[dict] = None,
                          enabled_toolsets: List[str] = None,
                          session_id: str = None,
@@ -554,6 +567,8 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         context_length: Model's context window size in tokens.
     """
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
+    from rich.panel import Panel
+    from rich.table import Table
     if get_toolset_for_tool is None:
         from model_tools import get_toolset_for_tool
 
@@ -761,6 +776,21 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                 right_lines.append(line)
     except Exception:
         pass  # Never break the banner over an update check
+
+    # Pip-install warning — `pip install hermes-agent` is not the supported
+    # install path (it exists on PyPI for internal/CI reasons, not end users).
+    # Such installs miss the git checkout + installer-managed deps, so updates,
+    # self-update, and issue triage don't behave correctly. Warn, don't block.
+    try:
+        from hermes_cli.config import detect_install_method
+        if detect_install_method() == "pip":
+            right_lines.append(
+                "[bold yellow]⚠ pip install not officially supported[/]"
+                "[dim yellow] — exists for reasons other than user install; "
+                "expect instability and an inability to support issues[/]"
+            )
+    except Exception:
+        pass  # Never break the banner over the install-method check
 
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)

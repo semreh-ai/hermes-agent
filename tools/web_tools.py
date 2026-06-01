@@ -97,6 +97,7 @@ from tools.registry import tool_error
 from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names for tests
 
     build_vendor_gateway_url,
+    peek_nous_access_token as _peek_nous_access_token,
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
