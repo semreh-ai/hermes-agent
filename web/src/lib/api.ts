@@ -390,6 +390,8 @@ export const api = {
   // Cron jobs
   getCronJobs: (profile = "all") =>
     fetchJSON<CronJob[]>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`),
+  getCronDeliveryTargets: () =>
+    fetchJSON<{ targets: CronDeliveryTarget[] }>("/api/cron/delivery-targets"),
   createCronJob: (job: { prompt: string; schedule: string; name?: string; deliver?: string }, profile = "default") =>
     fetchJSON<CronJob>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`, {
       method: "POST",
@@ -588,6 +590,36 @@ export const api = {
     fetchJSON<MessagingPlatformTestResult>(
       `/api/messaging/platforms/${encodeURIComponent(id)}/test`,
       { method: "POST" },
+    ),
+  startTelegramOnboarding: (body: { bot_name?: string }) =>
+    fetchJSON<TelegramOnboardingStartResponse>(
+      "/api/messaging/telegram/onboarding/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  getTelegramOnboardingStatus: (pairingId: string) =>
+    fetchJSON<TelegramOnboardingStatusResponse>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
+    ),
+  applyTelegramOnboarding: (
+    pairingId: string,
+    body: { allowed_user_ids: string[] },
+  ) =>
+    fetchJSON<TelegramOnboardingApplyResponse>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}/apply`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  cancelTelegramOnboarding: (pairingId: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
+      { method: "DELETE" },
     ),
 
   // Gateway / update actions
@@ -1293,6 +1325,30 @@ export interface EnvVarInfo {
   channel_managed?: boolean;
 }
 
+export interface TelegramOnboardingStartResponse {
+  pairing_id: string;
+  suggested_username: string;
+  deep_link: string;
+  qr_payload: string;
+  expires_at: string;
+}
+
+export type TelegramOnboardingStatusResponse =
+  | { status: "waiting"; expires_at: string }
+  | {
+      status: "ready";
+      bot_username: string;
+      owner_user_id?: string;
+      expires_at: string;
+    };
+
+export interface TelegramOnboardingApplyResponse {
+  ok: boolean;
+  platform: "telegram";
+  bot_username?: string;
+  needs_restart: true;
+}
+
 export interface SessionMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string | null;
@@ -1459,6 +1515,13 @@ export interface CronJob {
   last_error?: string | null;
 }
 
+export interface CronDeliveryTarget {
+  id: string;
+  name: string;
+  home_target_set: boolean;
+  home_env_var: string | null;
+}
+
 export interface SkillInfo {
   name: string;
   description: string;
@@ -1545,6 +1608,14 @@ export interface ModelAssignmentRequest {
   task?: string;
 }
 
+/** An auxiliary task still pinned to a provider that differs from the
+ *  newly-selected main provider after a main-model switch. */
+export interface StaleAuxAssignment {
+  task: string;
+  provider: string;
+  model: string;
+}
+
 export interface ModelAssignmentResponse {
   ok: boolean;
   scope?: string;
@@ -1552,6 +1623,10 @@ export interface ModelAssignmentResponse {
   model?: string;
   tasks?: string[];
   reset?: boolean;
+  /** Auxiliary slots still pinned to a different provider than the new main.
+   *  Switching main never clears aux pins; this lets the UI warn the user
+   *  their helper tasks aren't following the switch. Only set on scope:'main'. */
+  stale_aux?: StaleAuxAssignment[];
 }
 
 // ── OAuth provider types ────────────────────────────────────────────────
