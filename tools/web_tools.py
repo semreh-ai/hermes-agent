@@ -202,15 +202,17 @@ def _get_backend() -> str:
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Prefer an explicitly configured self-hosted SearXNG
-    # instance before vendor APIs (local fork behavior). Firecrawl also counts
-    # as available when the managed tool gateway is configured for Nous
-    # subscribers. Other free-tier backends (brave-free / ddgs) trail paid APIs.
+    # instance before vendor APIs (local fork behavior). Explicit user
+    # credentials also beat the managed-tool-gateway probe so deliberate setup
+    # is not pre-empted by a Nous OAuth token whose subscription tier may not
+    # actually grant web-search access. Other free-tier backends trail paid APIs.
     backend_candidates = (
         ("searxng", _has_env("SEARXNG_URL")),
-        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
-        ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("parallel", _has_env("PARALLEL_API_KEY")),
+        ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
+        ("firecrawl", _is_tool_gateway_ready()),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
