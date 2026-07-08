@@ -60,7 +60,7 @@ _HERMES_CORE_TOOLS = [
     # Cronjob management
     "cronjob",
     # Oracle persona retrieval + citation validation
-    "oracle_persona_sync", "oracle_persona_search", "oracle_citation_validate",
+    "oracle_persona_sync", "oracle_persona_search", "oracle_persona_get_source", "oracle_citation_validate",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -192,7 +192,7 @@ TOOLSETS = {
 
     "oracle": {
         "description": "Oracle persona retrieval with Qdrant hybrid search and strict citation validation",
-        "tools": ["oracle_persona_sync", "oracle_persona_search", "oracle_citation_validate"],
+        "tools": ["oracle_persona_sync", "oracle_persona_search", "oracle_persona_get_source", "oracle_citation_validate"],
         "includes": []
     },
     

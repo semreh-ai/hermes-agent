@@ -7,6 +7,7 @@ stored under /home/hermes/data/oracle-sources.
 Tools:
 - oracle_persona_sync: build/update persona index
 - oracle_persona_search: hybrid retrieve citations (RRF/DBSF fusion)
+- oracle_persona_get_source: fetch full source text by persona_id + source_id
 - oracle_citation_validate: strict quote-in-source validation
 """
 
@@ -30,6 +31,7 @@ DATA_ROOT = Path(os.getenv("ORACLE_DATA_ROOT", "/home/hermes/data/oracle-sources
 QDRANT_PATH = Path(os.getenv("ORACLE_QDRANT_PATH", str(DATA_ROOT / "qdrant")))
 DENSE_MODEL_NAME = os.getenv("ORACLE_DENSE_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 SPARSE_DIM = int(os.getenv("ORACLE_SPARSE_DIM", "65536"))
+PERSONA_ID_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 
 
 import importlib.util
@@ -53,9 +55,17 @@ def _check_oracle_requirements() -> bool:
     return _HAS_QDRANT and _HAS_ST and DATA_ROOT.exists()
 
 
+def _normalize_persona_id(persona_id: str) -> str:
+    clean = str(persona_id or "").strip().lower()
+    if not PERSONA_ID_RE.fullmatch(clean):
+        raise ValueError("invalid persona_id: use 1-64 lowercase letters, numbers, underscores, or hyphens")
+    return clean
+
+
 def _collection_name(persona_id: str) -> str:
-    clean = re.sub(r"[^a-zA-Z0-9_]+", "_", str(persona_id).strip().lower())
-    return f"oracle_{clean or 'persona'}"
+    safe = _normalize_persona_id(persona_id)
+    encoded = "".join("_u" if ch == "_" else "_d" if ch == "-" else ch for ch in safe)
+    return f"oracle_{encoded or 'persona'}"
 
 
 def _stable_point_id(source_id: str) -> int:
@@ -126,7 +136,18 @@ def _qdrant_client_context() -> Iterator[Any]:
 
 
 def _persona_sources_path(persona_id: str) -> Path:
-    return DATA_ROOT / "personas" / persona_id / "SOURCES.json"
+    return DATA_ROOT / "personas" / _normalize_persona_id(persona_id) / "SOURCES.json"
+
+
+def _resolve_index_file(path_value: Any) -> Path:
+    p = Path(str(path_value)).expanduser()
+    if not p.is_absolute():
+        p = DATA_ROOT / p
+    resolved = p.resolve(strict=False)
+    data_root = DATA_ROOT.resolve(strict=False)
+    if not resolved.is_relative_to(data_root):
+        raise ValueError(f"source index_file outside ORACLE_DATA_ROOT: {resolved}")
+    return resolved
 
 
 def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
@@ -148,6 +169,7 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
 
 
 def _load_persona_records(persona_id: str, max_docs: int | None = None) -> List[Dict[str, Any]]:
+    persona_id = _normalize_persona_id(persona_id)
     src_path = _persona_sources_path(persona_id)
     if not src_path.exists():
         raise FileNotFoundError(f"Missing persona registry: {src_path}")
@@ -166,7 +188,7 @@ def _load_persona_records(persona_id: str, max_docs: int | None = None) -> List[
         idx_file = s.get("index_file")
         if not idx_file:
             continue
-        p = Path(str(idx_file))
+        p = _resolve_index_file(idx_file)
         for row in _iter_jsonl(p):
             source_id = str(row.get("source_id") or "").strip()
             text = str(row.get("text") or "").strip()
@@ -302,6 +324,10 @@ def _search_persona(persona_id: str, query: str, top_k: int, fusion: str) -> Dic
                 "query": query,
             }
 
+        # Ask Qdrant for more than the requested final count so duplicate
+        # source_ids from dense+sparse fusion can be removed without starving
+        # the caller of unique citations.
+        query_limit = max(top_k, min(100, top_k * 4))
         result = client.query_points(
             collection_name=col,
             prefetch=[
@@ -309,20 +335,28 @@ def _search_persona(persona_id: str, query: str, top_k: int, fusion: str) -> Dic
                 models.Prefetch(query=q_sparse, using="sparse", limit=max(20, top_k * 4)),
             ],
             query=models.FusionQuery(fusion=fusion),
-            limit=top_k,
+            limit=query_limit,
             with_payload=True,
         )
 
         points = getattr(result, "points", result)
         citations = []
-        for rank, p in enumerate(points, start=1):
+        seen_source_ids: set[str] = set()
+        for p in points:
             payload = getattr(p, "payload", {}) or {}
             text = str(payload.get("text") or "")
+            source_id = payload.get("source_id")
+            source_id_key = str(source_id or "").strip()
+            if source_id_key:
+                if source_id_key in seen_source_ids:
+                    continue
+                seen_source_ids.add(source_id_key)
+            rank = len(citations) + 1
             citations.append(
                 {
                     "rank": rank,
                     "score": getattr(p, "score", None),
-                    "source_id": payload.get("source_id"),
+                    "source_id": source_id,
                     "source_type": payload.get("source_type"),
                     "datetime": payload.get("datetime"),
                     "canonical_url": payload.get("canonical_url"),
@@ -330,6 +364,8 @@ def _search_persona(persona_id: str, query: str, top_k: int, fusion: str) -> Dic
                     "text": text,
                 }
             )
+            if len(citations) >= top_k:
+                break
 
     return {
         "success": True,
@@ -342,6 +378,11 @@ def _search_persona(persona_id: str, query: str, top_k: int, fusion: str) -> Dic
 
 
 def oracle_persona_sync_tool(args: Dict[str, Any]) -> str:
+    try:
+        persona_id = _normalize_persona_id(args.get("persona_id") or "dejaru22")
+    except ValueError as e:
+        return tool_error(str(e), success=False)
+
     if not _check_oracle_requirements():
         return tool_error(
             "Oracle requirements missing. Need qdrant-client + sentence-transformers and existing ORACLE_DATA_ROOT.",
@@ -352,7 +393,6 @@ def oracle_persona_sync_tool(args: Dict[str, Any]) -> str:
             },
         )
 
-    persona_id = str(args.get("persona_id") or "dejaru22").strip().lower()
     rebuild = bool(args.get("rebuild", False))
     max_docs = args.get("max_docs")
     try:
@@ -373,6 +413,11 @@ def oracle_persona_search_tool(args: Dict[str, Any]) -> str:
     if not query:
         return tool_error("query is required")
 
+    try:
+        persona_id = _normalize_persona_id(args.get("persona_id") or "dejaru22")
+    except ValueError as e:
+        return tool_error(str(e), success=False)
+
     if not _check_oracle_requirements():
         return tool_error(
             "Oracle requirements missing. Need qdrant-client + sentence-transformers and existing ORACLE_DATA_ROOT.",
@@ -383,7 +428,6 @@ def oracle_persona_search_tool(args: Dict[str, Any]) -> str:
             },
         )
 
-    persona_id = str(args.get("persona_id") or "dejaru22").strip().lower()
     top_k = int(args.get("top_k", 8))
     top_k = max(1, min(top_k, 25))
     fusion = str(args.get("fusion") or "rrf")
@@ -411,8 +455,52 @@ def _source_text_map(persona_id: str) -> Dict[str, str]:
     return {str(r.get("source_id")): str(r.get("text") or "") for r in rows if r.get("source_id")}
 
 
+def _find_persona_record(persona_id: str, source_id: str) -> Dict[str, Any] | None:
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        return None
+    for row in _load_persona_records(persona_id):
+        if str(row.get("source_id") or "").strip() == source_id:
+            return row
+    return None
+
+
+def oracle_persona_get_source_tool(args: Dict[str, Any]) -> str:
+    """Return one full normalized source record by persona_id + source_id."""
+    try:
+        persona_id = _normalize_persona_id(args.get("persona_id") or "dejaru22")
+    except ValueError as e:
+        return tool_error(str(e), success=False)
+    source_id = str(args.get("source_id") or "").strip()
+    if not source_id:
+        return tool_error("source_id is required", success=False, persona_id=persona_id)
+
+    try:
+        record = _find_persona_record(persona_id, source_id)
+    except Exception as e:
+        return tool_error(f"Failed loading persona sources: {e}", success=False, persona_id=persona_id, source_id=source_id)
+
+    if record is None:
+        return tool_error(
+            f"source_id not found for persona '{persona_id}': {source_id}",
+            success=False,
+            persona_id=persona_id,
+            source_id=source_id,
+        )
+
+    return tool_result(
+        success=True,
+        persona_id=persona_id,
+        source_id=source_id,
+        source=record,
+    )
+
+
 def oracle_citation_validate_tool(args: Dict[str, Any]) -> str:
-    persona_id = str(args.get("persona_id") or "dejaru22").strip().lower()
+    try:
+        persona_id = _normalize_persona_id(args.get("persona_id") or "dejaru22")
+    except ValueError as e:
+        return tool_error(str(e), success=False)
     claims = args.get("claims")
     if not isinstance(claims, list) or not claims:
         return tool_error("claims must be a non-empty array")
@@ -478,6 +566,10 @@ def oracle_citation_validate(args: Dict[str, Any]) -> str:
     return oracle_citation_validate_tool(args)
 
 
+def oracle_persona_get_source(args: Dict[str, Any]) -> str:
+    return oracle_persona_get_source_tool(args)
+
+
 ORACLE_PERSONA_SYNC_SCHEMA = {
     "name": "oracle_persona_sync",
     "description": (
@@ -487,7 +579,7 @@ ORACLE_PERSONA_SYNC_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22)"},
+            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22). Must match [a-z0-9_-]{1,64}."},
             "rebuild": {"type": "boolean", "description": "If true, drop and rebuild the collection", "default": False},
             "max_docs": {"type": "integer", "description": "Optional cap for indexing docs", "minimum": 1},
         },
@@ -505,12 +597,29 @@ ORACLE_PERSONA_SEARCH_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22)"},
+            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22). Must match [a-z0-9_-]{1,64}."},
             "query": {"type": "string", "description": "Natural-language retrieval query"},
             "top_k": {"type": "integer", "description": "Number of citations to return", "default": 8, "minimum": 1, "maximum": 25},
             "fusion": {"type": "string", "enum": ["rrf", "dbsf"], "default": "rrf", "description": "Fusion strategy for combining dense+sparse retrieval"},
         },
         "required": ["query"],
+    },
+}
+
+
+ORACLE_PERSONA_GET_SOURCE_SCHEMA = {
+    "name": "oracle_persona_get_source",
+    "description": (
+        "Fetch the full normalized source record for a persona citation by source_id. "
+        "Use when search snippets are truncated or exact quote text is needed before validation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22). Must match [a-z0-9_-]{1,64}."},
+            "source_id": {"type": "string", "description": "Exact source_id to retrieve"},
+        },
+        "required": ["source_id"],
     },
 }
 
@@ -524,7 +633,7 @@ ORACLE_CITATION_VALIDATE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22)"},
+            "persona_id": {"type": "string", "description": "Persona ID (default: dejaru22). Must match [a-z0-9_-]{1,64}."},
             "claims": {
                 "type": "array",
                 "description": "Claims with cited source IDs and verbatim quotes",
@@ -561,6 +670,15 @@ registry.register(
     handler=lambda args, **kw: oracle_persona_search_tool(args),
     check_fn=_check_oracle_requirements,
     emoji="🔎",
+)
+
+registry.register(
+    name="oracle_persona_get_source",
+    toolset="oracle",
+    schema=ORACLE_PERSONA_GET_SOURCE_SCHEMA,
+    handler=lambda args, **kw: oracle_persona_get_source_tool(args),
+    check_fn=lambda: DATA_ROOT.exists(),
+    emoji="📜",
 )
 
 registry.register(
