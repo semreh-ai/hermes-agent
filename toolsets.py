@@ -64,6 +64,10 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Oracle persona retrieval + citation validation (fork feature)
+    "oracle_persona_sync", "oracle_persona_search", "oracle_persona_get_source", "oracle_citation_validate",
+    # Cross-platform messaging (fork feature — gated on gateway running via check_fn)
+    "send_message",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -211,6 +215,24 @@ TOOLSETS = {
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
         "tools": ["cronjob"],
+        "includes": []
+    },
+
+    "oracle": {
+        "description": "Oracle persona retrieval with Qdrant hybrid search and strict citation validation",
+        "tools": ["oracle_persona_sync", "oracle_persona_search", "oracle_persona_get_source", "oracle_citation_validate"],
+        "includes": []
+    },
+
+    "messaging": {
+        "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
+        "tools": ["send_message"],
+        "includes": []
+    },
+
+    "tailscale": {
+        "description": "Expose local services to your tailnet via Tailscale Serve, and transfer files between tailnet devices",
+        "tools": ["tailscale_serve", "tailscale_status"],
         "includes": []
     },
     
