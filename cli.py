@@ -15113,6 +15113,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _bind_prompt_submit_keys(kb, handle_enter)
         
         @kb.add('escape', 'enter')
+        @kb.add('c-o')  # Fork: Ctrl+O newline fallback (some terminals eat Alt+Enter)
         def handle_alt_enter(event):
             """Alt+Enter inserts a newline for multi-line input.
 
