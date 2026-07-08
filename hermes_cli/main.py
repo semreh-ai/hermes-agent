@@ -9067,6 +9067,20 @@ def cmd_update(args):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)
+        # Fork: on a custom branch the real update source is upstream/main,
+        # not origin — report upstream news alongside the vanilla check.
+        if not getattr(args, "branch", None) and _is_fork(
+            _get_origin_url(["git"], PROJECT_ROOT)
+        ):
+            from hermes_cli.fork_update import upstream_news_count
+
+            news = upstream_news_count(["git"], PROJECT_ROOT)
+            if news > 0:
+                print(
+                    f"→ Upstream is {news} commit(s) ahead — run `hermes update` to rebase onto it."
+                )
+            elif news == 0:
+                print("✓ Up to date with upstream/main")
         _cmd_update_check(
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),
