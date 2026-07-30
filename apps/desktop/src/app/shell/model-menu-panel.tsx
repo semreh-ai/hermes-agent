@@ -408,7 +408,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                         : null
 
                     const isCurrent = activeId !== null
-                    const name = modelDisplayParts(family.id).name
+                    // Keep the variant tag (`Latest`/`Preview`/…) — prettifyBase
+                    // strips that suffix, so name alone collapses ids like
+                    // `composer-latest` to a bare "Composer" sitting next to
+                    // "Composer 2". Edit Models already renders name + tag.
+                    const { name, tag } = modelDisplayParts(family.id)
                     // Capabilities are looked up against the active/base id; the
                     // -fast variant carries the same param support as its base.
                     const caps = group.provider.capabilities?.[family.id]
@@ -465,6 +469,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                         >
                           <span className="min-w-0 flex-1 truncate">
                             <HighlightMatches query={search} text={name} />
+                            {tag ? <span className="text-(--ui-text-tertiary)"> {tag}</span> : null}
                             {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                           </span>
                           {isCurrent ? (

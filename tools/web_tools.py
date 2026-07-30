@@ -284,6 +284,50 @@ def _get_search_backend() -> str:
     return _get_capability_backend("search")
 
 
+_MAX_SEARCH_FALLBACKS = 3
+
+
+def _get_search_fallbacks(primary: str) -> List[str]:
+    """Return the bounded, ordered opt-in search fallback list.
+
+    Fallbacks are deliberately configuration-only. Provider availability is
+    checked when the fallback is attempted so an unavailable provider can
+    contribute an actionable diagnostic instead of silently disappearing from
+    the configured chain.
+    """
+    raw = _load_web_config().get("search_fallbacks", [])
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1].split(",")
+        else:
+            raw = [raw]
+    if not isinstance(raw, list):
+        logger.warning("web.search_fallbacks must be a YAML list; ignoring it")
+        return []
+
+    primary = (primary or "").strip().lower()
+    fallbacks: List[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        name = value.strip().lower()
+        if not name or name == primary or name in fallbacks:
+            continue
+        fallbacks.append(name)
+        if len(fallbacks) >= _MAX_SEARCH_FALLBACKS:
+            logger.warning(
+                "Ignoring search fallbacks after the first %d entries",
+                _MAX_SEARCH_FALLBACKS,
+            )
+            break
+    return fallbacks
+
+
 def _get_extract_backend() -> str:
     """Determine which backend to use for web_extract specifically.
 
@@ -298,13 +342,36 @@ def _get_extract_backend() -> str:
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
-    Reads ``web.{capability}_backend`` from config; if set and available,
-    uses it. Otherwise falls through to the shared ``_get_backend()``.
+    Reads ``web.{capability}_backend`` from config. An explicitly configured
+    known backend wins even when its credentials or endpoint are unavailable;
+    the provider can then return a precise setup error instead of silently
+    switching to a different backend. Unknown names and providers that do not
+    support the requested capability fall through to ``_get_backend()``.
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    if specific and _is_backend_available(specific):
-        return specific
+    if specific:
+        provider = _registered_web_provider(specific)
+        if provider is not None:
+            try:
+                supports_capability = (
+                    provider.supports_search()
+                    if capability == "search"
+                    else provider.supports_extract()
+                )
+            except Exception as exc:  # noqa: BLE001 — fall through safely
+                logger.debug(
+                    "web provider %r capability check failed: %s",
+                    specific,
+                    exc,
+                )
+                supports_capability = False
+            if supports_capability:
+                return specific
+        elif specific in _LEGACY_WEB_BACKENDS:
+            # Built-in providers may be unavailable because a URL/key is
+            # missing, but explicit configuration must still be authoritative.
+            return specific
     return _get_backend()
 
 
@@ -683,13 +750,31 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         )
 
         backend = _get_search_backend()
+        fallback_names = _get_search_fallbacks(backend)
         provider = _wsp_get_provider(backend) if backend else None
         if provider is None or not provider.supports_search():
-            # Fall back to availability-walked active provider when the
-            # configured backend isn't a registered search provider (typo,
-            # uninstalled plugin, or capability mismatch).
-            provider = get_active_search_provider()
+            # Preserve the existing availability-walk for unknown or
+            # unregistered names. Explicitly configured registered providers
+            # are returned by the resolver even when unavailable, so their
+            # own precise setup error reaches the fallback chain.
+            configured_search = (
+                _load_web_config().get("search_backend")
+                or _load_web_config().get("backend")
+                or ""
+            )
+            configured_search = str(configured_search).strip().lower()
+            if not configured_search or configured_search != (backend or "").lower():
+                provider = get_active_search_provider()
+            else:
+                # An explicit but unregistered/disabled backend must remain the
+                # primary failure. Only search_fallbacks may cross that boundary.
+                provider = None
 
+        attempted: List[str] = []
+        failures: List[Dict[str, Any]] = []
+        response_data: Optional[Dict[str, Any]] = None
+
+        candidates: List[Any] = []
         if provider is None:
             # A bundled web plugin the user explicitly disabled looks
             # identical to "no provider" here — point at the real cause
@@ -697,31 +782,115 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             disabled_key = _disabled_web_plugin_for(capability="search")
             if disabled_key:
                 _vendor = disabled_key.split("/", 1)[-1]
-                response_data = {
+                primary_error = (
+                    f"web.search_backend is set to '{_vendor}', but its "
+                    f"plugin ('{disabled_key}') is disabled in config. "
+                    f"Re-enable it with `hermes plugins enable {disabled_key}` "
+                    "(or remove it from plugins.disabled)."
+                )
+            else:
+                primary_error = (
+                    "No web search provider configured. "
+                    "Run `hermes tools` to set one up."
+                )
+            failures.append({"provider": backend or "<none>", "error": primary_error})
+        else:
+            candidates.append((provider.name, provider))
+
+        # Fall through only through the explicitly configured chain. This also
+        # lets a fallback run when the primary provider is not registered.
+        for fallback_name in fallback_names:
+            fallback_provider = _wsp_get_provider(fallback_name)
+            candidates.append((fallback_name, fallback_provider))
+
+        for provider_name, candidate in candidates:
+            if candidate is None:
+                failures.append(
+                    {
+                        "provider": provider_name,
+                        "error": "provider is not registered",
+                    }
+                )
+                continue
+            try:
+                if not candidate.supports_search():
+                    failures.append(
+                        {
+                            "provider": provider_name,
+                            "error": "provider does not support search",
+                        }
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    {
+                        "provider": provider_name,
+                        "error": f"capability check failed: {exc}",
+                    }
+                )
+                continue
+
+            attempted.append(provider_name)
+            logger.info(
+                "Web search via %s: '%s' (limit: %d)",
+                provider_name,
+                query,
+                limit,
+            )
+            try:
+                candidate_response = candidate.search(query, limit)
+            except Exception as exc:  # noqa: BLE001 — continue configured chain
+                if not fallback_names:
+                    raise
+                candidate_response = {
                     "success": False,
-                    "error": (
-                        f"web.search_backend is set to '{_vendor}', but its "
-                        f"plugin ('{disabled_key}') is disabled in config. "
-                        f"Re-enable it with `hermes plugins enable {disabled_key}` "
-                        "(or remove it from plugins.disabled)."
-                    ),
+                    "error": f"{type(exc).__name__}: {exc}",
                 }
+
+            if isinstance(candidate_response, dict):
+                response_data = candidate_response
             else:
                 response_data = {
                     "success": False,
-                    "error": (
-                        "No web search provider configured. "
-                        "Run `hermes tools` to set one up."
-                    ),
+                    "error": "provider returned an invalid response envelope",
                 }
-        else:
-            logger.info(
-                "Web search via %s: '%s' (limit: %d)",
-                provider.name, query, limit,
-            )
-            response_data = provider.search(query, limit)
 
-        debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            if response_data.get("success") is True:
+                break
+
+            error = str(response_data.get("error") or "provider returned failure")
+            failure: Dict[str, Any] = {
+                "provider": provider_name,
+                "error": error[:500],
+            }
+            provider_diagnostics = response_data.get("diagnostics")
+            if isinstance(provider_diagnostics, dict):
+                failure["diagnostics"] = provider_diagnostics
+            failures.append(failure)
+
+        if response_data is None:
+            response_data = {
+                "success": False,
+                "error": failures[0]["error"] if failures else "Web search failed",
+            }
+
+        # Preserve the selected provider's response shape, but make every
+        # configured failover attempt observable. This is intentionally absent
+        # when the primary succeeds, so normal responses remain unchanged.
+        if fallback_names and failures:
+            diagnostics = response_data.get("diagnostics")
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            diagnostics = dict(diagnostics)
+            diagnostics["fallback"] = {
+                "attempted": attempted,
+                "failures": failures,
+            }
+            response_data["diagnostics"] = diagnostics
+
+        response_payload = response_data.get("data")
+        web_payload = response_payload.get("web", []) if isinstance(response_payload, dict) else []
+        debug_call_data["results_count"] = len(web_payload)
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)
         _debug.log_call("web_search_tool", debug_call_data)
